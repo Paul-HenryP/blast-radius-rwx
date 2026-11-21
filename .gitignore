@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Data & Local Caches
+/data/
+*.patch
+*.json
+*.jsonl
+blast-radius-sample/
+blast-radius-sample.tar.gz
+
+# OS
+.DS_Store
