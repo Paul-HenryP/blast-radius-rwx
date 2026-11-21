@@ -1,7 +1,6 @@
 import os
 import json
 import glob
-import sys
 
 
 def get_changed_files(patch_path):
@@ -16,27 +15,19 @@ def get_changed_files(patch_path):
 
 
 def optimize_workers(tests):
-    """
-    Dynamically finds the mathematically cheapest worker count (1-8).
-    Minimizes: max(worker_loads) + (2.0 * num_workers)
-    """
-    if not tests:
-        return []
-
+    if not tests: return []
     tests_sorted = sorted(tests, key=lambda x: x.get("seconds", 0.0), reverse=True)
     best_workers, best_cost = [], float('inf')
 
     for num_workers in range(1, 9):
         workers = [[] for _ in range(num_workers)]
         loads = [0.0] * num_workers
-
         for test in tests_sorted:
             min_idx = loads.index(min(loads))
             workers[min_idx].append(test["number"])
             loads[min_idx] += test.get("seconds", 0.0)
 
         cost = max(loads) + (2.0 * num_workers)
-
         if cost < best_cost:
             best_cost = cost
             best_workers = [w for w in workers if w]
@@ -46,102 +37,125 @@ def optimize_workers(tests):
 
 def main():
     data_dir = os.environ.get("DATA_DIR", "/data")
-    if not os.path.exists(data_dir):
-        data_dir = "./data"
+    if not os.path.exists(data_dir): data_dir = "./data"
 
-    tests_file = os.path.join(data_dir, "tests.json")
-    commits_dir = os.path.join(data_dir, "commits")
-
-    with open(tests_file, "r", encoding="utf-8") as f:
+    with open(os.path.join(data_dir, "tests.json"), "r", encoding="utf-8") as f:
         tests_data = json.load(f)
-
     tests = [t for t in tests_data.get("tests", []) if "number" in t]
 
     tests_by_file = {}
     for t in tests:
-        t_file = t["file"]
-        if t_file not in tests_by_file:
-            tests_by_file[t_file] = []
-        tests_by_file[t_file].append(t)
+        tests_by_file.setdefault(t["file"], []).append(t)
 
-    # Core engine tests that break easily when any sub-component is touched
-    core_test_files = {
-        "tests/test_optimizer.py",
-        "tests/test_expressions.py",
-        "tests/test_parser.py",
-        "tests/test_generator.py",
-        "tests/test_executor.py",
-        "tests/test_transforms.py",
-        "tests/test_schema.py",
-        "tests/test_time.py",
-        "tests/test_diff.py",
-        "tests/test_helper.py"
-    }
-
-    patch_files = glob.glob(os.path.join(commits_dir, "*.patch"))
+    patch_files = glob.glob(os.path.join(data_dir, "commits", "*.patch"))
 
     for patch_path in patch_files:
         commit_id = os.path.basename(patch_path).replace(".patch", "")
         changed_files = get_changed_files(patch_path)
 
+        relevant_files = [c for c in changed_files if c.startswith("sqlglot/") or c.startswith("tests/")]
         selected_tests = set()
         run_all = False
 
-        for cfile in changed_files:
-            # 1. Test Files & Fixtures
+        for cfile in relevant_files:
+            parts = cfile.split("/")
+
+            # 1. Test Files & Surgical SQL Fixtures
             if cfile.startswith("tests/"):
                 if cfile in tests_by_file:
                     selected_tests.update(t["number"] for t in tests_by_file[cfile])
 
-                # Map SQL fixtures back to their testing suites (e.g. tests/fixtures/optimizer/X.sql -> test_optimizer.py)
-                parts = cfile.split("/")
-                if len(parts) >= 3 and parts[1] == "fixtures":
-                    target = f"tests/test_{parts[2]}.py"
-                    if target in tests_by_file:
-                        selected_tests.update(t["number"] for t in tests_by_file[target])
-                    if parts[2] == "optimizer" and "tests/test_optimizer.py" in tests_by_file:
-                        selected_tests.update(t["number"] for t in tests_by_file["tests/test_optimizer.py"])
-                continue
+                if "fixtures" in parts:
+                    fixture_name = parts[-1].replace(".sql", "").lower()
+                    # THE FIX: strip trailing 's' to match singular test definitions
+                    base_fixture = fixture_name.split("__")[0].rstrip('s')
+                    matched = False
 
-            if not cfile.startswith("sqlglot/"):
+                    for t in tests:
+                        if base_fixture in t["id"].lower():
+                            selected_tests.add(t["number"])
+                            matched = True
+
+                    if not matched:
+                        parent_dir = parts[-2]
+                        target = f"tests/test_{parent_dir}.py"
+                        if target in tests_by_file:
+                            selected_tests.update(t["number"] for t in tests_by_file[target])
                 continue
 
             basename = os.path.basename(cfile).replace(".py", "")
             dirname = os.path.dirname(cfile)
 
-            # 2. Root structural files (serde.py, expressions.py, tokens.py) -> Run everything
-            if dirname == "sqlglot" or dirname == "sqlglot/dataframe":
+            # 2. Core Engine Files
+            if dirname == "sqlglot" and basename in {
+                "serde", "expressions", "tokens", "diff",
+                "parser", "generator", "helper", "schema",
+                "time", "errors", "jsonpath", "trie"
+            }:
                 run_all = True
                 break
 
-            # 3. Component Files (Dialects, Parsers, Optimizer, Typing) -> Run specific tests + Core tests
-            if any(x in dirname for x in ["dialects", "parsers", "optimizer", "typing", "executor"]):
-                # Run the safety net
-                for ct in core_test_files:
-                    if ct in tests_by_file:
-                        selected_tests.update(t["number"] for t in tests_by_file[ct])
+            # 3. Component Dependencies
+            if "generators" in dirname:
+                targets = [f"tests/dialects/test_{basename}.py", "tests/test_generator.py"]
+                for tgt in targets:
+                    if tgt in tests_by_file:
+                        selected_tests.update(t["number"] for t in tests_by_file[tgt])
 
-                # Also include specific dialect tests
-                if "dialects" in dirname or "parsers" in dirname:
-                    targets = [f"tests/dialects/test_{basename}.py", "tests/dialects/test_dialect.py"]
-                    for tgt in targets:
-                        if tgt in tests_by_file:
-                            selected_tests.update(t["number"] for t in tests_by_file[tgt])
+            elif "parsers" in dirname:
+                targets = [
+                    f"tests/dialects/test_{basename}.py",
+                    "tests/test_parser.py",
+                    "tests/test_optimizer.py",
+                    "tests/test_expressions.py"
+                ]
+                for tgt in targets:
+                    if tgt in tests_by_file:
+                        selected_tests.update(t["number"] for t in tests_by_file[tgt])
 
-            # 4. Catch-all fallback
+            elif "dialects" in dirname:
+                targets = [
+                    f"tests/dialects/test_{basename}.py",
+                    "tests/test_dialect.py",
+                    "tests/test_optimizer.py"
+                ]
+                for tgt in tests_by_file:  # wait, bug in V9? no, loops are safe here
+                    pass
+                for tgt in targets:
+                    if tgt in tests_by_file:
+                        selected_tests.update(t["number"] for t in tests_by_file[tgt])
+
+            elif "optimizer" in dirname:
+                targets = [
+                    "tests/test_optimizer.py",
+                    f"tests/optimizer/test_{basename}.py",
+                    "tests/test_executor.py"
+                ]
+                for tgt in targets:
+                    if tgt in tests_by_file:
+                        selected_tests.update(t["number"] for t in tests_by_file[tgt])
+
+            elif "executor" in dirname:
+                targets = ["tests/test_executor.py", f"tests/executor/test_{basename}.py"]
+                for tgt in targets:
+                    if tgt in tests_by_file:
+                        selected_tests.update(t["number"] for t in tests_by_file[tgt])
+
             else:
-                for t_file in tests_by_file:
-                    if basename in t_file:
-                        selected_tests.update(t["number"] for t in tests_by_file[t_file])
+                targets = [f"tests/test_{basename}.py", "tests/test_optimizer.py", "tests/test_executor.py"]
+                for tgt in targets:
+                    if tgt in tests_by_file:
+                        selected_tests.update(t["number"] for t in tests_by_file[tgt])
 
-        if run_all or not changed_files:
+        # 4. Final Selection Logic
+        if run_all:
             final_tests = tests
+        elif not relevant_files:
+            final_tests = []
         else:
             final_tests = [t for t in tests if t["number"] in selected_tests]
-
-        # Avoid the deadly 300s penalty if we failed to select any tests
-        if not final_tests and changed_files:
-            final_tests = tests
+            if not final_tests:
+                final_tests = tests
 
         workers = optimize_workers(final_tests)
         print(json.dumps({"commit": commit_id, "workers": workers}), flush=True)
