@@ -321,6 +321,391 @@ def _stmt_lines_lookup(cfile, old_ast, old_lines, file_lines_map, tm_funcs, idxs
     return selected_nums, bool(selected_nums)
 
 
+
+SAFE_NONE_TYPES = {
+    "None", "bool", "int", "float", "str", "bytes", "list", "dict", "set", "frozenset", "tuple",
+    "Sequence", "Mapping", "Iterable", "Iterator", "Callable", "type", "Type", "Path",
+    "Table", "Expr", "Expression", "Dialect", "DialectType", "Token", "TokenType", "Tokenizer",
+    "Parser", "Generator", "Scope", "Schema", "MappingSchema", "Step", "Plan", "Node", "Context",
+    "NormalizationStrategy", "ErrorLevel", "DataType", "TypeAnnotator", "Keep", "KeepType",
+    "Journal", "Diff", "Action", "ScopeType", "JoinHint", "Window", "Select", "Union", "Subquery",
+}
+UNSAFE_NONE_TYPES = {"Any", "object", "reverse_key", "ndarray", "NDArray", "DataFrame", "Series", "Mock", "MagicMock"}
+_IMPORT_TIME_ATTRS_CACHE = None
+_ENUM_INFO_CACHE = {}
+
+
+def _file_imports_unsafe_eq(old_ast):
+    for node in ast.walk(old_ast):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                root = a.name.split(".")[0]
+                if root in ("numpy", "pandas", "unittest"):
+                    return True
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            root = node.module.split(".")[0]
+            if root in ("numpy", "pandas"):
+                return True
+    return False
+
+
+def _ann_is_safe_for_none(ann):
+    if ann is None:
+        return False
+    if isinstance(ann, ast.Constant):
+        if ann.value is None:
+            return True
+        if isinstance(ann.value, str):
+            try:
+                return _ann_is_safe_for_none(ast.parse(ann.value, mode="eval").body)
+            except SyntaxError:
+                return False
+        return False
+    if isinstance(ann, ast.Name):
+        return ann.id in SAFE_NONE_TYPES and ann.id not in UNSAFE_NONE_TYPES
+    if isinstance(ann, ast.Attribute):
+        if ann.attr in UNSAFE_NONE_TYPES:
+            return False
+        if isinstance(ann.value, ast.Name) and ann.value.id in ("exp", "expressions", "t", "typing"):
+            return ann.attr not in UNSAFE_NONE_TYPES and (ann.attr in SAFE_NONE_TYPES or ann.attr[:1].isupper())
+        return ann.attr in SAFE_NONE_TYPES
+    if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
+        return _ann_is_safe_for_none(ann.left) and _ann_is_safe_for_none(ann.right)
+    if isinstance(ann, ast.Subscript):
+        base = ann.value
+        base_name = base.attr if isinstance(base, ast.Attribute) else (base.id if isinstance(base, ast.Name) else "")
+        if base_name in ("Optional", "Union", "ClassVar", "Final"):
+            sl = ann.slice
+            if isinstance(sl, ast.Tuple):
+                return all(_ann_is_safe_for_none(e) for e in sl.elts)
+            return _ann_is_safe_for_none(sl)
+        if base_name in ("list", "List", "dict", "Dict", "set", "Set", "frozenset", "FrozenSet", "tuple", "Tuple", "Sequence", "Mapping", "Iterable"):
+            return True
+        return False
+    return False
+
+
+def _collect_safe_none_targets(cls_node, func_node):
+    safe_vars = set()
+    safe_self_attrs = set()
+    if func_node is not None:
+        args = func_node.args
+        for a in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
+            if _ann_is_safe_for_none(a.annotation):
+                safe_vars.add(a.arg)
+        for n in ast.walk(func_node):
+            if isinstance(n, ast.AnnAssign) and _ann_is_safe_for_none(n.annotation):
+                if isinstance(n.target, ast.Name):
+                    safe_vars.add(n.target.id)
+                elif isinstance(n.target, ast.Attribute) and isinstance(n.target.value, ast.Name) and n.target.value.id == "self":
+                    safe_self_attrs.add(n.target.attr)
+    if cls_node is not None:
+        for item in cls_node.body:
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name) and _ann_is_safe_for_none(item.annotation):
+                safe_self_attrs.add(item.target.id)
+            elif isinstance(item, ast.FunctionDef) and item.name == "__init__":
+                for n in ast.walk(item):
+                    if isinstance(n, ast.AnnAssign) and _ann_is_safe_for_none(n.annotation):
+                        if isinstance(n.target, ast.Attribute) and isinstance(n.target.value, ast.Name) and n.target.value.id == "self":
+                            safe_self_attrs.add(n.target.attr)
+    return safe_vars, safe_self_attrs
+
+
+def _enum_class_kind(cls_name, old_ast):
+    """Return 'pure' (non-str/int Enum), 'mixin' (str/int Enum), or None."""
+    if cls_name in _ENUM_INFO_CACHE:
+        return _ENUM_INFO_CACHE[cls_name]
+    trees = [old_ast]
+    for node in old_ast.body:
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("sqlglot"):
+            if any(a.name == cls_name or a.asname == cls_name for a in node.names):
+                mod_rel = node.module.replace(".", "/") + ".py"
+                _, mt = _get_old_ast(mod_rel)
+                if mt is not None:
+                    trees.append(mt)
+    kind = None
+    for t_ast in trees:
+        for node in t_ast.body:
+            if isinstance(node, ast.ClassDef) and node.name == cls_name:
+                bnames = {
+                    (b.attr if isinstance(b, ast.Attribute) else (b.id if isinstance(b, ast.Name) else ""))
+                    for b in node.bases
+                }
+                if bnames & {"Enum", "AutoName", "IntEnum", "StrEnum"}:
+                    if bnames & {"str", "int", "float", "bytes", "IntEnum", "StrEnum"}:
+                        kind = "mixin"
+                    else:
+                        kind = "pure"
+                    break
+        if kind is not None:
+            break
+    _ENUM_INFO_CACHE[cls_name] = kind
+    return kind
+
+
+def _self_attr_only_assigned_enum(attr_name, enum_name, cls_node):
+    if cls_node is None:
+        return False
+    class_const_ok = set()
+    for stmt in cls_node.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            val = stmt.value
+            if isinstance(val, ast.Attribute) and isinstance(val.value, ast.Name) and val.value.id == enum_name:
+                class_const_ok.add(stmt.targets[0].id)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            val = stmt.value
+            if isinstance(val, ast.Attribute) and isinstance(val.value, ast.Name) and val.value.id == enum_name:
+                class_const_ok.add(stmt.target.id)
+
+    assigned = 0
+    for node in ast.walk(cls_node):
+        val = None
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "self" and t.attr == attr_name for t in node.targets):
+                val = node.value
+        elif isinstance(node, ast.AnnAssign):
+            t = node.target
+            if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id == "self" and t.attr == attr_name:
+                val = node.value
+        if val is None:
+            continue
+        assigned += 1
+        ok = False
+        if isinstance(val, ast.Call) and isinstance(val.func, ast.Name) and val.func.id == enum_name:
+            ok = True
+        elif isinstance(val, ast.Attribute) and isinstance(val.value, ast.Name) and val.value.id == enum_name:
+            ok = True
+        elif isinstance(val, ast.Attribute) and isinstance(val.value, ast.Name) and val.value.id == "self" and val.attr in class_const_ok:
+            ok = True
+        if not ok:
+            return False
+    return assigned > 0
+
+
+def _is_safe_identity_eq(cmp_node, cls_node, func_node, old_ast, unsafe_imports):
+    if unsafe_imports or len(cmp_node.ops) != 1 or len(cmp_node.comparators) != 1:
+        return False
+    left, right = cmp_node.left, cmp_node.comparators[0]
+    for target, other in ((right, left), (left, right)):
+        if isinstance(target, ast.Constant) and target.value is None:
+            safe_vars, safe_self_attrs = _collect_safe_none_targets(cls_node, func_node)
+            if isinstance(other, ast.Name) and other.id in safe_vars:
+                return True
+            if isinstance(other, ast.Attribute) and isinstance(other.value, ast.Name) and other.value.id == "self" and other.attr in safe_self_attrs:
+                return True
+        elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id[:1].isupper() and target.attr.isupper():
+            enum_name = target.value.id
+            ekind = _enum_class_kind(enum_name, old_ast)
+            if ekind == "pure":
+                safe_vars, safe_self_attrs = _collect_safe_none_targets(cls_node, func_node)
+                if isinstance(other, ast.Name) and other.id in safe_vars:
+                    return True
+                if isinstance(other, ast.Attribute) and isinstance(other.value, ast.Name) and other.value.id == "self" and other.attr in safe_self_attrs:
+                    return True
+            elif ekind == "mixin":
+                if isinstance(other, ast.Attribute) and isinstance(other.value, ast.Name) and other.value.id == "self":
+                    if _self_attr_only_assigned_enum(other.attr, enum_name, cls_node):
+                        return True
+    return False
+
+
+def _is_semantically_equivalent_ast(old_ast, new_ast):
+    """Return True iff all AST differences are provably safe is/== or is not/!= swaps."""
+    unsafe_imports = _file_imports_unsafe_eq(old_ast)
+    swap_pairs = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot)}
+    found_swap = False
+
+    def _walk(o, n, cls_node, func_node):
+        nonlocal found_swap
+        if type(o) is not type(n):
+            return False
+        if not isinstance(o, ast.AST):
+            if isinstance(o, list):
+                if len(o) != len(n):
+                    return False
+                return all(_walk(x, y, cls_node, func_node) for x, y in zip(o, n))
+            return o == n
+        if ast.dump(o, include_attributes=False) == ast.dump(n, include_attributes=False):
+            return True
+        if isinstance(o, ast.ClassDef):
+            cls_node = o
+        elif isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_node = o
+        elif isinstance(o, ast.Compare) and len(o.ops) == 1 and len(n.ops) == 1 and len(o.comparators) == 1 and len(n.comparators) == 1:
+            if (type(o.ops[0]), type(n.ops[0])) in swap_pairs:
+                if (
+                    ast.dump(o.left, include_attributes=False) == ast.dump(n.left, include_attributes=False)
+                    and ast.dump(o.comparators[0], include_attributes=False) == ast.dump(n.comparators[0], include_attributes=False)
+                    and _is_safe_identity_eq(o, cls_node, func_node, old_ast, unsafe_imports)
+                ):
+                    found_swap = True
+                    return True
+                return False
+        for field in o._fields:
+            if not _walk(getattr(o, field), getattr(n, field), cls_node, func_node):
+                return False
+        return True
+
+    return _walk(old_ast, new_ast, None, None) and found_swap
+
+
+def _changed_all_caps_class_attrs(changed_class_pairs):
+    """If class edits ONLY change RHS of existing ALL_CAPS class attributes, return their names."""
+    attrs = set()
+
+    def _scan_body(obody, nbody):
+        if len(obody) != len(nbody):
+            return False
+        for o_s, n_s in zip(obody, nbody):
+            if type(o_s) is not type(n_s):
+                return False
+            if ast.dump(o_s, include_attributes=False) == ast.dump(n_s, include_attributes=False):
+                continue
+            if isinstance(o_s, ast.Assign) and len(o_s.targets) == 1 and len(n_s.targets) == 1:
+                ot, nt = o_s.targets[0], n_s.targets[0]
+                if isinstance(ot, ast.Name) and isinstance(nt, ast.Name) and ot.id == nt.id and ot.id.isupper() and len(ot.id) >= 3:
+                    attrs.add(ot.id)
+                    continue
+                return False
+            if isinstance(o_s, ast.AnnAssign) and isinstance(o_s.target, ast.Name) and isinstance(n_s.target, ast.Name):
+                if (
+                    o_s.target.id == n_s.target.id
+                    and o_s.target.id.isupper()
+                    and len(o_s.target.id) >= 3
+                    and ast.dump(o_s.annotation, include_attributes=False) == ast.dump(n_s.annotation, include_attributes=False)
+                ):
+                    attrs.add(o_s.target.id)
+                    continue
+                return False
+            if isinstance(o_s, ast.ClassDef) and o_s.name == n_s.name:
+                if not _scan_body(o_s.body, n_s.body):
+                    return False
+                continue
+            return False
+        return True
+
+    for o_cls, n_cls in changed_class_pairs:
+        if not _scan_body(o_cls.body, n_cls.body):
+            return None
+    return attrs if attrs else None
+
+
+def _get_import_time_attrs():
+    global _IMPORT_TIME_ATTRS_CACHE
+    if _IMPORT_TIME_ATTRS_CACHE is not None:
+        return _IMPORT_TIME_ATTRS_CACHE
+    found = set()
+    pat = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b")
+    for p in (REPO_ROOT / "sqlglot").rglob("*.py"):
+        src = p.read_text(encoding="utf-8", errors="ignore")
+        if "def __new__" not in src and "def __init_subclass__" not in src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        lines = src.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in ("__new__", "__init_subclass__"):
+                seg = "\n".join(lines[node.lineno - 1 : node.end_lineno])
+                found.update(pat.findall(seg))
+    _IMPORT_TIME_ATTRS_CACHE = found
+    return found
+
+
+def _attr_defuse_narrow(attr_names, base_nums, tm_files, tm_funcs, tm_lines, idxs_to_nums):
+    """Narrow non-import-time ALL_CAPS class attribute edits via static def-use + line coverage."""
+    imp_attrs = _get_import_time_attrs()
+    if any(a in imp_attrs for a in attr_names):
+        return None
+
+    ref_nums = set()
+    direct_test_nums = set()
+    for attr in attr_names:
+        q1, q2 = f'"{attr}"', f"'{attr}'"
+        for folder in ("sqlglot", "tests"):
+            root = REPO_ROOT / folder
+            if not root.exists():
+                continue
+            for p in root.rglob("*.py"):
+                rel = p.relative_to(REPO_ROOT).as_posix()
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+                if attr not in txt:
+                    continue
+                if q1 in txt or q2 in txt:
+                    return None
+                if folder == "tests":
+                    if rel not in tm_files:
+                        return None
+                    direct_test_nums.update(idxs_to_nums(tm_files[rel]))
+                    continue
+                _, tree = _get_old_ast(rel)
+                if q1 in txt or q2 in txt:
+                    return None
+                if tree is None:
+                    return None
+
+                if folder == "tests":
+                    if rel not in tm_files:
+                        return None
+                    direct_test_nums.update(idxs_to_nums(tm_files[rel]))
+                    continue
+
+                # Collect class-body LHS definition target ids so we skip pure definitions
+                def_target_ids = set()
+                for n in ast.walk(tree):
+                    if isinstance(n, ast.ClassDef):
+                        for stmt in n.body:
+                            if isinstance(stmt, ast.Assign):
+                                for t in stmt.targets:
+                                    if isinstance(t, ast.Name) and t.id == attr:
+                                        def_target_ids.add(id(t))
+                            elif isinstance(stmt, ast.AnnAssign):
+                                if isinstance(stmt.target, ast.Name) and stmt.target.id == attr:
+                                    def_target_ids.add(id(stmt.target))
+
+                # Collect function/lambda spans to verify every reference is runtime (not import-time)
+                func_spans = []
+                for n in ast.walk(tree):
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        s = getattr(n, "lineno", None)
+                        e = getattr(n, "end_lineno", s)
+                        if s is not None:
+                            func_spans.append((s, e, n.lineno))
+
+                ref_lines = set()
+                for n in ast.walk(tree):
+                    is_ref = (isinstance(n, ast.Name) and n.id == attr and id(n) not in def_target_ids) or (
+                        isinstance(n, ast.Attribute) and n.attr == attr
+                    )
+                    if not is_ref:
+                        continue
+                    ln = getattr(n, "lineno", None)
+                    if ln is None:
+                        return None
+                    enc = [fs for fs in func_spans if fs[0] <= ln <= fs[1]]
+                    if not enc:
+                        return None  # module/class-level read -> import-time dependency!
+                    ref_lines.add(ln)
+
+                if ref_lines:
+                    flm = tm_lines.get(rel, {})
+                    for ln in ref_lines:
+                        l_nums, l_ok = _stmt_lines_lookup(rel, tree, {ln}, flm, tm_funcs, idxs_to_nums)
+                        if l_ok:
+                            ref_nums.update(l_nums)
+                        else:
+                            # If enclosing function was traced and line wasn't hit -> 0 tests reached it; else fallback
+                            enc_f = [fs[2] for fs in func_spans if fs[0] <= ln <= fs[1]]
+                            if any(f"{rel}:{fln}" in tm_funcs for fln in enc_f):
+                                continue
+                            if rel not in tm_files:
+                                return None
+
+    narrowed = (base_nums & ref_nums) | direct_test_nums
+    return narrowed if narrowed else None
+
+
 def _has_pep263_change(old_text, new_text):
     old_top = "\n".join(old_text.splitlines()[:2])
     new_top = "\n".join(new_text.splitlines()[:2])
@@ -369,6 +754,8 @@ def analyze_file_patch(rel_file, info):
         return False, True, new_text, set(), True, old_ast, None
 
     if ast.dump(old_ast, include_attributes=False) == ast.dump(new_ast, include_attributes=False):
+        return True, False, new_text, set(), False, old_ast, new_ast
+    if _is_semantically_equivalent_ast(old_ast, new_ast):
         return True, False, new_text, set(), False, old_ast, new_ast
 
     changed_defs = set()
@@ -875,11 +1262,14 @@ def main():
                             if ok_comp and comp_cands:
                                 narrowed.update(comp_cands)
 
-                    if narrowed:
-                        candidates.update(narrowed)
-                    else:
-                        f_cands = idxs_to_nums(tm_files.get(cfile, []))
-                        candidates.update(f_cands if f_cands else all_nums)
+                    base_cands = narrowed if narrowed else idxs_to_nums(tm_files.get(cfile, []))
+                    if changed_classes and base_cands and cfile.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
+                        cattrs = _changed_all_caps_class_attrs(changed_classes)
+                        if cattrs:
+                            du = _attr_defuse_narrow(cattrs, base_cands, tm_files, tm_funcs, tm_lines, idxs_to_nums)
+                            if du:
+                                base_cands = du
+                    candidates.update(base_cands if base_cands else all_nums)
                 else:
                     f_cands = idxs_to_nums(tm_files.get(cfile, []))
                     candidates.update(f_cands if f_cands else all_nums)
