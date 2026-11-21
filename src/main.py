@@ -817,6 +817,75 @@ def _extract_exp_key_name(key_node):
     return None
 
 
+
+STRING_DICT_NAMES = {
+    "FUNCTIONS",
+    "FUNCTIONS_WITH_ALIASED_ARGS",
+    "SHOW_PARSERS",
+    "STATEMENT_PARSERS",
+    "PROPERTY_PARSERS",
+    "KEYWORDS",
+    "DATE_PART_MAPPING",
+    "TYPE_MAPPING",
+}
+
+
+def _extract_str_key(key_node):
+    if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+        return key_node.value
+    return None
+
+
+def _changed_str_dict_keys(changed_class_pairs):
+    """If class edits ONLY change values for existing string keys in known dicts, return list of (cls_name, dict_name, key_str)."""
+    hits = []
+    for o_cls, n_cls in changed_class_pairs:
+        if len(o_cls.body) != len(n_cls.body):
+            return None
+        for o_s, n_s in zip(o_cls.body, n_cls.body):
+            if type(o_s) is not type(n_s):
+                return None
+            if ast.dump(o_s, include_attributes=False) == ast.dump(n_s, include_attributes=False):
+                continue
+            dname, o_val, n_val = None, None, None
+            if isinstance(o_s, ast.Assign) and len(o_s.targets) == 1 and len(n_s.targets) == 1:
+                if isinstance(o_s.targets[0], ast.Name) and isinstance(n_s.targets[0], ast.Name) and o_s.targets[0].id == n_s.targets[0].id:
+                    dname, o_val, n_val = o_s.targets[0].id, o_s.value, n_s.value
+            elif isinstance(o_s, ast.AnnAssign) and isinstance(o_s.target, ast.Name) and isinstance(n_s.target, ast.Name):
+                if o_s.target.id == n_s.target.id:
+                    dname, o_val, n_val = o_s.target.id, o_s.value, n_s.value
+            if dname not in STRING_DICT_NAMES or not isinstance(o_val, ast.Dict) or not isinstance(n_val, ast.Dict):
+                return None
+
+            o_map = {}
+            for k, v in zip(o_val.keys, o_val.values):
+                if k is None:
+                    return None  # dict unpacking (**...) -> too risky to narrow by key
+                sk = _extract_str_key(k)
+                if sk is None:
+                    return None
+                o_map[sk] = ast.dump(v, include_attributes=False)
+
+            n_map = {}
+            for k, v in zip(n_val.keys, n_val.values):
+                if k is None:
+                    return None
+                sk = _extract_str_key(k)
+                if sk is None:
+                    return None
+                n_map[sk] = ast.dump(v, include_attributes=False)
+
+            # Require exact same key set (no added/removed/renamed keys)
+            if set(o_map.keys()) != set(n_map.keys()):
+                return None
+
+            for sk in o_map:
+                if o_map[sk] != n_map[sk]:
+                    hits.append((o_cls.name, dname, sk))
+
+    return hits if hits else None
+
+
 def _changed_exp_dict_keys(changed_class_pairs):
     """If class edits ONLY change values for existing exp.Foo keys in class-level dicts, return (dict_names, exp_names)."""
     dict_names = set()
@@ -1350,6 +1419,7 @@ def main():
     tm_funcs = tm["funcs"]
     tm_lines = tm.get("lines", {})
     tm_exprs = tm.get("exprs", {})
+    tm_dict_keys = tm.get("dict_keys", {})
     tm_fixtures = tm["fixtures"]
     expr_by_name = defaultdict(set)
     for ek, eidxs in tm_exprs.items():
@@ -1473,6 +1543,29 @@ def main():
                                 if inter:
                                     base_cands = inter
                         else:
+                            sdict_hits = _changed_str_dict_keys(changed_classes)
+                            if sdict_hits and tm_dict_keys:
+                                dk_nums = set()
+                                all_ok = True
+                                for cname, dname, sk in sdict_hits:
+                                    # Check exact class and any nested Parser/Tokenizer/Generator class
+                                    matched_key = False
+                                    for prefix in (f"{cfile}:{cname}.{dname}:{sk}", f"{cfile}:Parser.{dname}:{sk}", f"{cfile}:Tokenizer.{dname}:{sk}", f"{cfile}:Generator.{dname}:{sk}"):
+                                        if prefix in tm_dict_keys and tm_dict_keys[prefix]:
+                                            dk_nums.update(idxs_to_nums(tm_dict_keys[prefix]))
+                                            matched_key = True
+                                    if not matched_key:
+                                        # Also check suffixed keys like "sqlglot/parsers/foo.py:FooParser.FUNCTIONS:BAR"
+                                        for dk, idxs in tm_dict_keys.items():
+                                            if dk.startswith(f"{cfile}:") and dk.endswith(f".{dname}:{sk}") and idxs:
+                                                dk_nums.update(idxs_to_nums(idxs))
+                                                matched_key = True
+                                                break
+                                    if not matched_key:
+                                        all_ok = False
+                                        break
+                                if all_ok and (base_cands & dk_nums):
+                                    base_cands = base_cands & dk_nums
                             cattrs = _changed_all_caps_class_attrs(changed_classes)
                             if cattrs:
                                 du = _attr_defuse_narrow(cattrs, base_cands, tm_files, tm_funcs, tm_lines, idxs_to_nums)

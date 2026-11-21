@@ -219,6 +219,7 @@ def _run_traced(item):
     touched_funcs = set()
     touched_lines = set()
     touched_fixtures = set()
+    touched_dict_keys = set()
     touched_tok_files = set()
     touched_par_files = set()
     touched_gen_files = set()
@@ -401,8 +402,42 @@ def _run_traced(item):
                 DialectCls.generator = orig_generator
             if orig_tokenizer is not None:
                 DialectCls.tokenizer = orig_tokenizer
+    # 4b. Hook Parser._find_parser to capture matched string keys in parser lookup dicts
+    ParserCls = None
+    orig_find_parser = None
+    try:
+        from sqlglot.parser import Parser as ParserCls
+        orig_find_parser = ParserCls._find_parser
+
+        def hooked_find_parser(self, parsers, trie=None, *args, **kwargs):
+            res = orig_find_parser(self, parsers, trie, *args, **kwargs)
+            try:
+                if res is not None and isinstance(parsers, dict) and self._prev is not None:
+                    prev_text = getattr(self._prev, "text", None)
+                    if isinstance(prev_text, str) and prev_text:
+                        for cls in type(self).__mro__:
+                            f = _cls_file(cls)
+                            rel = _to_rel(f)
+                            if not rel:
+                                continue
+                            for attr_name in ("SHOW_PARSERS", "STATEMENT_PARSERS", "PROPERTY_PARSERS", "FUNCTIONS"):
+                                d = getattr(cls, attr_name, None)
+                                if d is parsers:
+                                    for cand_k in (prev_text, prev_text.upper(), prev_text.lower()):
+                                        if cand_k in d:
+                                            touched_dict_keys.add(f"{rel}:{cls.__name__}.{attr_name}:{cand_k}")
+            except Exception:
+                pass
+            return res
+
+        ParserCls._find_parser = hooked_find_parser
+    except Exception:
+        pass
+
         if TypeAnnotatorCls is not None and orig_ta_init is not None:
             TypeAnnotatorCls.__init__ = orig_ta_init
+        if ParserCls is not None and orig_find_parser is not None:
+            ParserCls._find_parser = orig_find_parser
         concurrent.futures.ProcessPoolExecutor = orig_ppe
         multiprocessing.Pool = orig_mp_pool
         for mod, attr, orig in patched_mods:
@@ -449,6 +484,7 @@ def _run_traced(item):
         "par_files": rel_par,
         "gen_files": rel_gen,
         "fixtures": rel_fixtures,
+        "dict_keys": sorted(touched_dict_keys),
     }
 
 
@@ -476,7 +512,7 @@ def pytest_runtest_protocol(item, nextitem):
         except BaseException:
             payload = json.dumps({
                 "files": [], "funcs": [], "lines": {}, "exprs": [],
-                "tok_files": [], "par_files": [], "gen_files": [], "fixtures": [],
+                "tok_files": [], "par_files": [], "gen_files": [], "fixtures": [], "dict_keys": [],
                 "err": traceback.format_exc(),
             }).encode("utf-8")
 
@@ -511,6 +547,7 @@ def pytest_runtest_protocol(item, nextitem):
                 "par_files": data.get("par_files", []),
                 "gen_files": data.get("gen_files", []),
                 "fixtures": data.get("fixtures", []),
+                "dict_keys": data.get("dict_keys", []),
             }
 
     item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
@@ -593,6 +630,7 @@ def main():
     par_map = defaultdict(set)
     gen_map = defaultdict(set)
     fixtures_map = defaultdict(set)
+    dict_keys_map = defaultdict(set)
 
     for tid, info in merged.items():
         idx = test_to_idx[tid]
@@ -636,6 +674,7 @@ def main():
         "par_files": {k: sorted(v) for k, v in sorted(par_map.items())},
         "gen_files": {k: sorted(v) for k, v in sorted(gen_map.items())},
         "fixtures": {k: sorted(v) for k, v in sorted(fixtures_map.items())},
+        "dict_keys": {k: sorted(v) for k, v in sorted(dict_keys_map.items())},
     }
 
     OUTPUT_GZ.parent.mkdir(parents=True, exist_ok=True)
@@ -647,7 +686,7 @@ def main():
     print(
         f"SUCCESS! Traced {len(all_tests)} tests | "
         f"{len(files_map)} files | {len(funcs_map)} funcs | {total_lines} lines | "
-        f"{len(exprs_map)} exprs | {len(fixtures_map)} fixtures "
+        f"{len(exprs_map)} exprs | {len(fixtures_map)} fixtures | {len(dict_keys_map)} dict_keys "
         f"({size_kb:.1f} KB gz) -> {OUTPUT_GZ}",
         flush=True,
     )
