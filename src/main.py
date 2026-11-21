@@ -91,8 +91,10 @@ def parse_patch(patch_path):
                     files[cur]["old_lines"].add(cur_old_line)
                     cur_old_line += 1
                 elif line.startswith("+"):
-                    files[cur]["old_lines"].add(max(1, cur_old_line - 1))
-                    files[cur]["old_lines"].add(cur_old_line)
+                    prev_h = files[cur]["hunks"][-1][4]
+                    if len(prev_h) < 2 or not prev_h[-2].startswith("-"):
+                        files[cur]["old_lines"].add(max(1, cur_old_line - 1))
+                        files[cur]["old_lines"].add(cur_old_line)
                 elif line.startswith(" "):
                     cur_old_line += 1
     return files
@@ -706,6 +708,194 @@ def _attr_defuse_narrow(attr_names, base_nums, tm_files, tm_funcs, tm_lines, idx
     return narrowed if narrowed else None
 
 
+
+ANNOTATION_SENSITIVE_FILES = {
+    "sqlglot/_typing.py",
+    "sqlglot/diff.py",
+    "sqlglot/lineage.py",
+    "sqlglot/optimizer/pushdown_projections.py",
+}
+
+
+def _has_future_annotations(tree):
+    for node in tree.body[:6]:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            if any(a.name == "annotations" for a in node.names):
+                return True
+    return False
+
+
+def _is_type_checking_test(test):
+    if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
+        return True
+    if isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING":
+        return True
+    return False
+
+
+class _RuntimeNormalizer(ast.NodeTransformer):
+    def __init__(self, strip_docstrings=True, strip_annotations=False):
+        self.strip_docstrings = strip_docstrings
+        self.strip_annotations = strip_annotations
+
+    def _strip_doc(self, body):
+        if (
+            self.strip_docstrings
+            and body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            return body[1:]
+        return body
+
+    def visit_Module(self, node):
+        node.body = self._strip_doc(node.body)
+        self.generic_visit(node)
+        return node
+
+    def visit_ClassDef(self, node):
+        node.body = self._strip_doc(node.body)
+        self.generic_visit(node)
+        return node
+
+    def visit_FunctionDef(self, node):
+        node.body = self._strip_doc(node.body)
+        if self.strip_annotations:
+            node.returns = None
+            for a in list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs):
+                a.annotation = None
+            if node.args.vararg:
+                node.args.vararg.annotation = None
+            if node.args.kwarg:
+                node.args.kwarg.annotation = None
+        self.generic_visit(node)
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        return self.visit_FunctionDef(node)
+
+    def visit_AnnAssign(self, node):
+        self.generic_visit(node)
+        if self.strip_annotations:
+            if node.value is None:
+                return ast.Pass()
+            return ast.Assign(targets=[node.target], value=node.value)
+        return node
+
+    def visit_If(self, node):
+        if _is_type_checking_test(node.test):
+            # TYPE_CHECKING is always False at runtime; keep only orelse
+            if node.orelse:
+                return [self.visit(s) for s in node.orelse]
+            return ast.Pass()
+        self.generic_visit(node)
+        return node
+
+
+def _is_runtime_noop_ast(rel_file, old_text, new_text):
+    """True if old_text and new_text are identical after stripping docstrings, TYPE_CHECKING, and postponed annotations."""
+    try:
+        o_tree = ast.parse(old_text)
+        n_tree = ast.parse(new_text)
+    except SyntaxError:
+        return False
+    strip_doc = (rel_file != "sqlglot/expressions/core.py")
+    strip_ann = (
+        rel_file not in ANNOTATION_SENSITIVE_FILES
+        and _has_future_annotations(o_tree)
+        and _has_future_annotations(n_tree)
+    )
+    o_norm = _RuntimeNormalizer(strip_docstrings=strip_doc, strip_annotations=strip_ann).visit(o_tree)
+    n_norm = _RuntimeNormalizer(strip_docstrings=strip_doc, strip_annotations=strip_ann).visit(n_tree)
+    return ast.dump(o_norm, include_attributes=False) == ast.dump(n_norm, include_attributes=False)
+
+
+def _extract_exp_key_name(key_node):
+    if isinstance(key_node, ast.Attribute) and isinstance(key_node.value, ast.Name) and key_node.value.id in ("exp", "expressions"):
+        return key_node.attr
+    return None
+
+
+def _changed_exp_dict_keys(changed_class_pairs):
+    """If class edits ONLY change values for existing exp.Foo keys in class-level dicts, return (dict_names, exp_names)."""
+    dict_names = set()
+    exp_names = set()
+    for o_cls, n_cls in changed_class_pairs:
+        if len(o_cls.body) != len(n_cls.body):
+            return None
+        for o_s, n_s in zip(o_cls.body, n_cls.body):
+            if type(o_s) is not type(n_s):
+                return None
+            if ast.dump(o_s, include_attributes=False) == ast.dump(n_s, include_attributes=False):
+                continue
+            dname, o_val, n_val = None, None, None
+            if isinstance(o_s, ast.Assign) and len(o_s.targets) == 1 and len(n_s.targets) == 1:
+                if isinstance(o_s.targets[0], ast.Name) and isinstance(n_s.targets[0], ast.Name) and o_s.targets[0].id == n_s.targets[0].id:
+                    dname, o_val, n_val = o_s.targets[0].id, o_s.value, n_s.value
+            elif isinstance(o_s, ast.AnnAssign) and isinstance(o_s.target, ast.Name) and isinstance(n_s.target, ast.Name):
+                if o_s.target.id == n_s.target.id:
+                    dname, o_val, n_val = o_s.target.id, o_s.value, n_s.value
+            if not isinstance(o_val, ast.Dict) or not isinstance(n_val, ast.Dict):
+                return None
+            # Compare dict entries by key dump
+            o_map = {}
+            for k, v in zip(o_val.keys, o_val.values):
+                if k is None:
+                    o_map[("__UNPACK__", ast.dump(v, include_attributes=False))] = (k, v)
+                else:
+                    o_map[ast.dump(k, include_attributes=False)] = (k, v)
+            n_map = {}
+            for k, v in zip(n_val.keys, n_val.values):
+                if k is None:
+                    n_map[("__UNPACK__", ast.dump(v, include_attributes=False))] = (k, v)
+                else:
+                    n_map[ast.dump(k, include_attributes=False)] = (k, v)
+            all_ks = set(o_map.keys()) | set(n_map.keys())
+            for kd in all_ks:
+                ov = o_map.get(kd)
+                nv = n_map.get(kd)
+                if ov is not None and nv is not None:
+                    if ast.dump(ov[1], include_attributes=False) == ast.dump(nv[1], include_attributes=False):
+                        continue
+                k_node = ov[0] if ov is not None else nv[0]
+                ename = _extract_exp_key_name(k_node)
+                if ename is None:
+                    return None
+                dict_names.add(dname)
+                exp_names.add(ename)
+    return (dict_names, exp_names) if exp_names else None
+
+
+def _changed_test_methods(old_ast, new_ast):
+    """If edits in a tests/*.py file are strictly inside existing test_* methods, return [(cls_name, method_name)]."""
+    if len(old_ast.body) != len(new_ast.body):
+        return None
+    changed = []
+    for o, n in zip(old_ast.body, new_ast.body):
+        if type(o) is not type(n):
+            return None
+        if ast.dump(o, include_attributes=False) == ast.dump(n, include_attributes=False):
+            continue
+        if isinstance(o, ast.ClassDef) and o.name == n.name:
+            if len(o.body) != len(n.body):
+                return None
+            for om, nm in zip(o.body, n.body):
+                if type(om) is not type(nm):
+                    return None
+                if ast.dump(om, include_attributes=False) == ast.dump(nm, include_attributes=False):
+                    continue
+                if isinstance(om, (ast.FunctionDef, ast.AsyncFunctionDef)) and om.name == nm.name and om.name.startswith("test_"):
+                    changed.append((o.name, om.name))
+                else:
+                    return None
+        elif isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)) and o.name == n.name and o.name.startswith("test_"):
+            changed.append((None, o.name))
+        else:
+            return None
+    return changed if changed else None
+
+
 def _has_pep263_change(old_text, new_text):
     old_top = "\n".join(old_text.splitlines()[:2])
     new_top = "\n".join(new_text.splitlines()[:2])
@@ -754,6 +944,8 @@ def analyze_file_patch(rel_file, info):
         return False, True, new_text, set(), True, old_ast, None
 
     if ast.dump(old_ast, include_attributes=False) == ast.dump(new_ast, include_attributes=False):
+        return True, False, new_text, set(), False, old_ast, new_ast
+    if _is_runtime_noop_ast(rel_file, old_text, new_text):
         return True, False, new_text, set(), False, old_ast, new_ast
     if _is_semantically_equivalent_ast(old_ast, new_ast):
         return True, False, new_text, set(), False, old_ast, new_ast
@@ -1159,6 +1351,10 @@ def main():
     tm_lines = tm.get("lines", {})
     tm_exprs = tm.get("exprs", {})
     tm_fixtures = tm["fixtures"]
+    expr_by_name = defaultdict(set)
+    for ek, eidxs in tm_exprs.items():
+        ename = ek.rsplit(":", 1)[-1]
+        expr_by_name[ename].update(eidxs)
 
     def idxs_to_nums(idxs):
         out = set()
@@ -1263,18 +1459,44 @@ def main():
                                 narrowed.update(comp_cands)
 
                     base_cands = narrowed if narrowed else idxs_to_nums(tm_files.get(cfile, []))
-                    if changed_classes and base_cands and cfile.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
-                        cattrs = _changed_all_caps_class_attrs(changed_classes)
-                        if cattrs:
-                            du = _attr_defuse_narrow(cattrs, base_cands, tm_files, tm_funcs, tm_lines, idxs_to_nums)
-                            if du:
-                                base_cands = du
+                    if changed_classes and base_cands and cfile.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/generator.py", "sqlglot/parser.py", "sqlglot/typing/")):
+                        exp_dict_res = _changed_exp_dict_keys(changed_classes)
+                        if exp_dict_res:
+                            dnames, enames = exp_dict_res
+                            if all(en in expr_by_name for en in enames):
+                                expr_nums = set()
+                                for en in enames:
+                                    expr_nums.update(idxs_to_nums(expr_by_name[en]))
+                                inter = base_cands & expr_nums
+                                if "EXPRESSION_METADATA" in dnames:
+                                    inter |= {t["number"] for t in tests if t["file"] == "tests/test_typing.py"}
+                                if inter:
+                                    base_cands = inter
+                        else:
+                            cattrs = _changed_all_caps_class_attrs(changed_classes)
+                            if cattrs:
+                                du = _attr_defuse_narrow(cattrs, base_cands, tm_files, tm_funcs, tm_lines, idxs_to_nums)
+                                if du:
+                                    base_cands = du
                     candidates.update(base_cands if base_cands else all_nums)
                 else:
                     f_cands = idxs_to_nums(tm_files.get(cfile, []))
                     candidates.update(f_cands if f_cands else all_nums)
             elif cfile.startswith("tests/"):
-                if cfile in tm_files:
+                t_narrow = set()
+                if not syn_err and not finfo["is_new"] and not finfo["is_del"] and old_ast is not None and new_ast is not None:
+                    cmethods = _changed_test_methods(old_ast, new_ast)
+                    if cmethods:
+                        for cname, mname in cmethods:
+                            tid = f"{cfile}::{cname}::{mname}" if cname else f"{cfile}::{mname}"
+                            if tid in id_to_num:
+                                t_narrow.add(id_to_num[tid])
+                            else:
+                                t_narrow.clear()
+                                break
+                if t_narrow:
+                    candidates.update(t_narrow)
+                elif cfile in tm_files:
                     candidates.update(idxs_to_nums(tm_files[cfile]))
                 else:
                     candidates.update(t["number"] for t in tests if t["file"] == cfile)
@@ -1310,7 +1532,11 @@ def main():
                     and est_cpu_s < LIVE_EV_THRESHOLD * expected_savings_s
                     and live_budget_used_s + est_cpu_s <= TOTAL_LIVE_BUDGET_S
                 ):
-                    if not preloaded:
+                    if not preloaded and any(
+                        test_by_num[n]["file"] in ("tests/test_executor.py", "tests/dialects/test_duckdb.py")
+                        or "dataframe" in test_by_num[n]["file"]
+                        for n in maybe_live
+                    ):
                         _preload_heavy_third_party()
                         preloaded = True
                     live_calls += 1
