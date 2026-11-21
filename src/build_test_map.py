@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Builds a compact, isolated dependency map for SQLGlot using os.fork() + sys.monitoring.
-Forces inner ProcessPoolExecutor / multiprocessing.Pool calls to run synchronously
-in-process (with pickle roundtrip) so 100% of worker execution & serde.dump/load are traced.
+Builds a complete, isolated dependency map (v4) for SQLGlot using os.fork() + sys.monitoring.
+Outputs gzipped JSON to src/test_map.json.gz containing:
+- files:     file-level coverage (including Expr MRO + Dialect MRO + Typing MRO)
+- funcs:     function-level coverage with nested-function closure rollup
+- lines:     exact per-line coverage inside sqlglot/ (with sync ProcessPoolExecutor)
+- exprs:     exact Expression subclass coverage (fixes sqlglot/expressions/*.py blind spots)
+- tok_files / par_files / gen_files: component-separated Dialect coverage
+- fixtures:  exact tests/fixtures/ usage via open() hooks
 """
 
+import ast
+import gzip
 import json
 import os
 import subprocess
@@ -13,7 +20,7 @@ from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path.cwd().resolve()  # /app/sqlglot in Docker
-OUTPUT_JSON = REPO_ROOT.parent / "src" / "test_map.json"
+OUTPUT_GZ = REPO_ROOT.parent / "src" / "test_map.json.gz"
 SHARD_DIR = REPO_ROOT / ".trace_shards"
 
 PYTEST_PLUGIN_CODE = r'''
@@ -38,8 +45,12 @@ TESTS_PREFIX = str((REPO_ROOT / "tests").resolve()) + os.sep
 FIXTURES_PREFIX = str((REPO_ROOT / "tests" / "fixtures").resolve()) + os.sep
 SHARD_DIR = Path(os.environ["TRACE_SHARD_DIR"])
 
+DIALECTS_INIT = str((REPO_ROOT / "sqlglot" / "dialects" / "__init__.py").resolve())
+TYPING_INIT = str((REPO_ROOT / "sqlglot" / "typing" / "__init__.py").resolve())
+
 WORKER_RESULTS = {}
 FIRST_ERRORS = []
+_CLASS_FILE_CACHE = {}
 
 
 def _to_rel(path_str):
@@ -55,14 +66,42 @@ def _to_rel(path_str):
     return None
 
 
-def _record_cls_tree(cls, touched_files):
+def _cls_file(cls):
+    if cls in _CLASS_FILE_CACHE:
+        return _CLASS_FILE_CACHE[cls]
+    res = None
+    try:
+        f = inspect.getsourcefile(cls) or inspect.getfile(cls)
+        if f and f.startswith(PKG_PREFIX):
+            res = f
+    except Exception:
+        pass
+    _CLASS_FILE_CACHE[cls] = res
+    return res
+
+
+def _record_cls_tree(cls, *target_sets):
     if cls is None or not isinstance(cls, type):
         return
     for base in getattr(cls, "__mro__", ()):
+        f = _cls_file(base)
+        if f:
+            for s in target_sets:
+                s.add(f)
+
+
+def _record_typing_mro(d_cls, touched_files):
+    if d_cls is None or not isinstance(d_cls, type):
+        return
+    touched_files.add(TYPING_INIT)
+    for base in getattr(d_cls, "__mro__", ()):
         try:
-            f = inspect.getsourcefile(base) or inspect.getfile(base)
-            if f and f.startswith(PKG_PREFIX):
-                touched_files.add(f)
+            mod_name = getattr(base, "__module__", "")
+            if mod_name.startswith("sqlglot.dialects."):
+                d_name = mod_name.rsplit(".", 1)[-1]
+                tf = REPO_ROOT / "sqlglot" / "typing" / f"{d_name}.py"
+                if tf.exists():
+                    touched_files.add(str(tf))
         except Exception:
             pass
 
@@ -88,33 +127,6 @@ def _call_with_pickle(fn, *args, **kwargs):
     return res
 
 
-class _SyncFuture:
-    def __init__(self, fn, *args, **kwargs):
-        self._exc = None
-        self._res = None
-        try:
-            self._res = _call_with_pickle(fn, *args, **kwargs)
-        except BaseException as e:
-            self._exc = e
-
-    def result(self, timeout=None):
-        if self._exc is not None:
-            raise self._exc
-        return self._res
-
-    def exception(self, timeout=None):
-        return self._exc
-
-    def done(self):
-        return True
-
-    def cancelled(self):
-        return False
-
-    def add_done_callback(self, fn):
-        fn(self)
-
-
 class _SyncProcessPoolExecutor:
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
         if initializer is not None:
@@ -127,7 +139,12 @@ class _SyncProcessPoolExecutor:
         return False
 
     def submit(self, fn, /, *args, **kwargs):
-        return _SyncFuture(fn, *args, **kwargs)
+        fut = concurrent.futures.Future()
+        try:
+            fut.set_result(_call_with_pickle(fn, *args, **kwargs))
+        except BaseException as e:
+            fut.set_exception(e)
+        return fut
 
     def map(self, fn, *iterables, timeout=None, chunksize=1):
         return [_call_with_pickle(fn, *vals) for vals in zip(*iterables)]
@@ -200,7 +217,12 @@ class _SyncMPPool:
 def _run_traced(item):
     touched_files = set()
     touched_funcs = set()
+    touched_lines = set()
     touched_fixtures = set()
+    touched_tok_files = set()
+    touched_par_files = set()
+    touched_gen_files = set()
+    seen_expr_classes = set()
 
     # 1. Force inner ProcessPoolExecutor / multiprocessing.Pool to run synchronously in-process
     orig_ppe = concurrent.futures.ProcessPoolExecutor
@@ -239,37 +261,106 @@ def _run_traced(item):
         _record_open_path(file)
         return orig_io_open(file, *args, **kwargs)
 
-    # 3. Hook Dialect.get_or_raise so cached dialects/parsers/generators/typing are ALWAYS recorded
-    orig_get_or_raise = None
+    # 3. Hook Expr.__init__ to capture ALL sqlglot/expressions/*.py classes instantiated
+    ExprCls = None
+    orig_expr_init = None
+    try:
+        from sqlglot.expressions.core import Expr as ExprCls
+        orig_expr_init = ExprCls.__init__
+
+        def hooked_expr_init(self, **args):
+            cls = type(self)
+            if cls not in seen_expr_classes:
+                seen_expr_classes.add(cls)
+            orig_expr_init(self, **args)
+
+        ExprCls.__init__ = hooked_expr_init
+    except Exception:
+        pass
+
+    # 4. Decoupled hooks on Dialect (get_or_raise / parser / generator / tokenizer) & TypeAnnotator
     DialectCls = None
+    orig_get_or_raise = None
+    orig_parser = None
+    orig_generator = None
+    orig_tokenizer = None
+    TypeAnnotatorCls = None
+    orig_ta_init = None
+
     try:
         from sqlglot.dialects.dialect import Dialect as DialectCls
         orig_get_or_raise = DialectCls.get_or_raise
+        orig_parser = DialectCls.parser
+        orig_generator = DialectCls.generator
+        orig_tokenizer = DialectCls.tokenizer
 
         @classmethod
         def hooked_get_or_raise(cls, dialect=None):
             res = orig_get_or_raise.__func__(cls, dialect)
             try:
+                touched_files.add(DIALECTS_INIT)
                 d_cls = res if isinstance(res, type) else type(res)
                 _record_cls_tree(d_cls, touched_files)
-                for attr in ("parser_class", "generator_class", "tokenizer_class", "Parser", "Generator", "Tokenizer"):
-                    _record_cls_tree(getattr(d_cls, attr, None), touched_files)
-                d_name = getattr(d_cls, "__module__", "").rsplit(".", 1)[-1]
-                if d_name:
-                    typing_file = REPO_ROOT / "sqlglot" / "typing" / f"{d_name}.py"
-                    if typing_file.exists():
-                        touched_files.add(str(typing_file))
             except Exception:
                 pass
             return res
 
+        def hooked_parser(self, *args, **kwargs):
+            p = orig_parser(self, *args, **kwargs)
+            try:
+                _record_cls_tree(type(self), touched_files)
+                _record_cls_tree(type(p), touched_files, touched_par_files)
+            except Exception:
+                pass
+            return p
+
+        def hooked_generator(self, *args, **kwargs):
+            g = orig_generator(self, *args, **kwargs)
+            try:
+                _record_cls_tree(type(self), touched_files)
+                _record_cls_tree(type(g), touched_files, touched_gen_files)
+            except Exception:
+                pass
+            return g
+
+        def hooked_tokenizer(self, *args, **kwargs):
+            tok = orig_tokenizer(self, *args, **kwargs)
+            try:
+                _record_cls_tree(type(self), touched_files)
+                _record_cls_tree(type(tok), touched_files, touched_tok_files)
+            except Exception:
+                pass
+            return tok
+
         DialectCls.get_or_raise = hooked_get_or_raise
+        DialectCls.parser = hooked_parser
+        DialectCls.generator = hooked_generator
+        DialectCls.tokenizer = hooked_tokenizer
     except Exception:
         pass
 
-    # 4. sys.monitoring PY_START for fast file + function (co_firstlineno) tracing
+    try:
+        from sqlglot.optimizer.annotate_types import TypeAnnotator as TypeAnnotatorCls
+        orig_ta_init = TypeAnnotatorCls.__init__
+
+        def hooked_ta_init(self, *args, **kwargs):
+            orig_ta_init(self, *args, **kwargs)
+            try:
+                d = getattr(self, "dialect", None)
+                if d is not None:
+                    d_cls = d if isinstance(d, type) else type(d)
+                    _record_cls_tree(d_cls, touched_files)
+                    _record_typing_mro(d_cls, touched_files)
+            except Exception:
+                pass
+
+        TypeAnnotatorCls.__init__ = hooked_ta_init
+    except Exception:
+        pass
+
+    # 5. sys.monitoring PY_START + LINE (with DISABLE for low overhead)
     tool_id = _pick_tool_id()
-    sys.monitoring.use_tool_id(tool_id, "blast_mapper")
+    sys.monitoring.use_tool_id(tool_id, "blast_mapper_v4")
 
     def on_py_start(code, instruction_offset):
         fn = code.co_filename
@@ -280,34 +371,85 @@ def _run_traced(item):
             touched_files.add(fn)
         return sys.monitoring.DISABLE
 
+    def on_line(code, lineno):
+        fn = code.co_filename
+        if fn.startswith(PKG_PREFIX):
+            touched_lines.add((fn, lineno))
+        return sys.monitoring.DISABLE
+
     sys.monitoring.register_callback(tool_id, sys.monitoring.events.PY_START, on_py_start)
-    sys.monitoring.set_events(tool_id, sys.monitoring.events.PY_START)
+    sys.monitoring.register_callback(tool_id, sys.monitoring.events.LINE, on_line)
+    sys.monitoring.set_events(tool_id, sys.monitoring.events.PY_START | sys.monitoring.events.LINE)
 
     builtins.open = hooked_open
     io.open = hooked_io_open
     try:
         runtestprotocol(item, log=False, nextitem=None)
     finally:
+        sys.monitoring.set_events(tool_id, 0)
+        sys.monitoring.free_tool_id(tool_id)
         builtins.open = orig_open
         io.open = orig_io_open
-        if DialectCls is not None and orig_get_or_raise is not None:
-            DialectCls.get_or_raise = orig_get_or_raise
+        if ExprCls is not None and orig_expr_init is not None:
+            ExprCls.__init__ = orig_expr_init
+        if DialectCls is not None:
+            if orig_get_or_raise is not None:
+                DialectCls.get_or_raise = orig_get_or_raise
+            if orig_parser is not None:
+                DialectCls.parser = orig_parser
+            if orig_generator is not None:
+                DialectCls.generator = orig_generator
+            if orig_tokenizer is not None:
+                DialectCls.tokenizer = orig_tokenizer
+        if TypeAnnotatorCls is not None and orig_ta_init is not None:
+            TypeAnnotatorCls.__init__ = orig_ta_init
         concurrent.futures.ProcessPoolExecutor = orig_ppe
         multiprocessing.Pool = orig_mp_pool
         for mod, attr, orig in patched_mods:
             setattr(mod, attr, orig)
-        sys.monitoring.set_events(tool_id, 0)
-        sys.monitoring.free_tool_id(tool_id)
+
+    # Expand Expr class MROs into files + exprs
+    touched_exprs = set()
+    for cls in seen_expr_classes:
+        for base in getattr(cls, "__mro__", ()):
+            f = _cls_file(base)
+            if f:
+                touched_files.add(f)
+                r = _to_rel(f)
+                if r:
+                    touched_exprs.add(f"{r}:{base.__name__}")
 
     rel_files = sorted(r for r in (_to_rel(f) for f in touched_files) if r)
     rel_fixtures = sorted(r for r in (_to_rel(f) for f in touched_fixtures) if r)
+    rel_tok = sorted(r for r in (_to_rel(f) for f in touched_tok_files) if r)
+    rel_par = sorted(r for r in (_to_rel(f) for f in touched_par_files) if r)
+    rel_gen = sorted(r for r in (_to_rel(f) for f in touched_gen_files) if r)
+
     rel_funcs = []
     for fn, lineno in touched_funcs:
         r = _to_rel(fn)
         if r:
             rel_funcs.append(f"{r}:{lineno}")
     rel_funcs.sort()
-    return rel_files, rel_funcs, rel_fixtures
+
+    rel_lines = {}
+    for fn, lineno in touched_lines:
+        r = _to_rel(fn)
+        if r:
+            rel_lines.setdefault(r, []).append(lineno)
+    for r in rel_lines:
+        rel_lines[r].sort()
+
+    return {
+        "files": rel_files,
+        "funcs": rel_funcs,
+        "lines": rel_lines,
+        "exprs": sorted(touched_exprs),
+        "tok_files": rel_tok,
+        "par_files": rel_par,
+        "gen_files": rel_gen,
+        "fixtures": rel_fixtures,
+    }
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -328,18 +470,13 @@ def pytest_runtest_protocol(item, nextitem):
                     except Exception:
                         pass
 
-            rel_files, rel_funcs, rel_fixtures = _run_traced(item)
-            payload = json.dumps({
-                "files": rel_files,
-                "funcs": rel_funcs,
-                "fixtures": rel_fixtures,
-                "err": None,
-            }).encode("utf-8")
+            res = _run_traced(item)
+            res["err"] = None
+            payload = json.dumps(res, separators=(",", ":")).encode("utf-8")
         except BaseException:
             payload = json.dumps({
-                "files": [],
-                "funcs": [],
-                "fixtures": [],
+                "files": [], "funcs": [], "lines": {}, "exprs": [],
+                "tok_files": [], "par_files": [], "gen_files": [], "fixtures": [],
                 "err": traceback.format_exc(),
             }).encode("utf-8")
 
@@ -368,6 +505,11 @@ def pytest_runtest_protocol(item, nextitem):
             WORKER_RESULTS[item.nodeid] = {
                 "files": sorted(files_set),
                 "funcs": data.get("funcs", []),
+                "lines": data.get("lines", {}),
+                "exprs": data.get("exprs", []),
+                "tok_files": data.get("tok_files", []),
+                "par_files": data.get("par_files", []),
+                "gen_files": data.get("gen_files", []),
                 "fixtures": data.get("fixtures", []),
             }
 
@@ -378,8 +520,34 @@ def pytest_runtest_protocol(item, nextitem):
 def pytest_sessionfinish(session, exitstatus):
     SHARD_DIR.mkdir(parents=True, exist_ok=True)
     with open(SHARD_DIR / f"shard_{os.getpid()}.json", "w", encoding="utf-8") as f:
-        json.dump({"results": WORKER_RESULTS, "errors": FIRST_ERRORS}, f)
+        json.dump({"results": WORKER_RESULTS, "errors": FIRST_ERRORS}, f, separators=(",", ":"))
 '''
+
+
+def _rollup_nested_funcs(funcs_map):
+    """Union every nested def/async def/lambda's test set into its enclosing functions."""
+    rolled = 0
+    for py_path in sorted((REPO_ROOT / "sqlglot").rglob("*.py")):
+        rel = py_path.relative_to(REPO_ROOT).as_posix()
+        try:
+            tree = ast.parse(py_path.read_text(encoding="utf-8", errors="ignore"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                okey = f"{rel}:{node.lineno}"
+                extra = set()
+                for child in ast.walk(node):
+                    if child is not node and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        ikey = f"{rel}:{child.lineno}"
+                        if ikey in funcs_map:
+                            extra.update(funcs_map[ikey])
+                if extra:
+                    before = len(funcs_map.get(okey, set()))
+                    funcs_map.setdefault(okey, set()).update(extra)
+                    if len(funcs_map[okey]) > before:
+                        rolled += 1
+    return rolled
 
 
 def main():
@@ -393,7 +561,6 @@ def main():
     env["TRACE_REPO_ROOT"] = str(REPO_ROOT)
     env["TRACE_SHARD_DIR"] = str(SHARD_DIR)
     env["PYTHONPATH"] = f"{SHARD_DIR}{os.pathsep}{REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
-    env["SQLGLOTRS_TOKENIZER"] = "0"
 
     cmd = [sys.executable, "-m", "pytest", "-p", "_trace_plugin", "-q", "-n", "auto"]
     print(f"Running: {' '.join(cmd)}", flush=True)
@@ -418,38 +585,70 @@ def main():
     all_tests = sorted(merged.keys())
     test_to_idx = {tid: i for i, tid in enumerate(all_tests)}
 
-    files_map = defaultdict(list)
-    funcs_map = defaultdict(list)
-    fixtures_map = defaultdict(list)
+    files_map = defaultdict(set)
+    funcs_map = defaultdict(set)
+    lines_map = defaultdict(lambda: defaultdict(set))
+    exprs_map = defaultdict(set)
+    tok_map = defaultdict(set)
+    par_map = defaultdict(set)
+    gen_map = defaultdict(set)
+    fixtures_map = defaultdict(set)
 
     for tid, info in merged.items():
         idx = test_to_idx[tid]
         for f in info["files"]:
-            files_map[f].append(idx)
+            files_map[f].add(idx)
         for fn in info["funcs"]:
-            funcs_map[fn].append(idx)
+            funcs_map[fn].add(idx)
+        for rel, lnos in info.get("lines", {}).items():
+            fl = lines_map[rel]
+            for ln in lnos:
+                fl[str(ln)].add(idx)
+        for ex in info.get("exprs", []):
+            exprs_map[ex].add(idx)
+        for f in info.get("tok_files", []):
+            tok_map[f].add(idx)
+        for f in info.get("par_files", []):
+            par_map[f].add(idx)
+        for f in info.get("gen_files", []):
+            gen_map[f].add(idx)
         for fx in info["fixtures"]:
-            fixtures_map[fx].append(idx)
+            fixtures_map[fx].add(idx)
 
-    if len(funcs_map) == 0 or len(fixtures_map) == 0:
+    rolled = _rollup_nested_funcs(funcs_map)
+    print(f"Rolled up {rolled} outer functions with nested closures.", flush=True)
+
+    if len(funcs_map) == 0 or len(lines_map) == 0 or len(exprs_map) == 0:
         raise RuntimeError(
-            f"ERROR: Tracing incomplete! files={len(files_map)} funcs={len(funcs_map)} fixtures={len(fixtures_map)}"
+            f"ERROR: Tracing incomplete! funcs={len(funcs_map)} lines={len(lines_map)} exprs={len(exprs_map)}"
         )
 
     final_map = {
         "tests": all_tests,
         "files": {k: sorted(v) for k, v in sorted(files_map.items())},
         "funcs": {k: sorted(v) for k, v in sorted(funcs_map.items())},
+        "lines": {
+            rel: {ln: sorted(v) for ln, v in sorted(lmap.items(), key=lambda kv: int(kv[0]))}
+            for rel, lmap in sorted(lines_map.items())
+        },
+        "exprs": {k: sorted(v) for k, v in sorted(exprs_map.items())},
+        "tok_files": {k: sorted(v) for k, v in sorted(tok_map.items())},
+        "par_files": {k: sorted(v) for k, v in sorted(par_map.items())},
+        "gen_files": {k: sorted(v) for k, v in sorted(gen_map.items())},
         "fixtures": {k: sorted(v) for k, v in sorted(fixtures_map.items())},
     }
 
-    OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_JSON.write_text(json.dumps(final_map, separators=(",", ":")), encoding="utf-8")
-    size_kb = OUTPUT_JSON.stat().st_size / 1024
+    OUTPUT_GZ.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(OUTPUT_GZ, "wt", encoding="utf-8", compresslevel=6) as gz:
+        json.dump(final_map, gz, separators=(",", ":"))
+
+    size_kb = OUTPUT_GZ.stat().st_size / 1024
+    total_lines = sum(len(v) for v in final_map["lines"].values())
     print(
         f"SUCCESS! Traced {len(all_tests)} tests | "
-        f"{len(files_map)} files | {len(funcs_map)} funcs | {len(fixtures_map)} fixtures "
-        f"({size_kb:.1f} KB) -> {OUTPUT_JSON}",
+        f"{len(files_map)} files | {len(funcs_map)} funcs | {total_lines} lines | "
+        f"{len(exprs_map)} exprs | {len(fixtures_map)} fixtures "
+        f"({size_kb:.1f} KB gz) -> {OUTPUT_GZ}",
         flush=True,
     )
 

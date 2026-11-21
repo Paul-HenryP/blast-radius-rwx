@@ -2,6 +2,7 @@
 import builtins
 import concurrent.futures
 import glob
+import gzip
 import importlib
 import importlib.abc
 import importlib.machinery
@@ -26,15 +27,15 @@ except ImportError:
 SRC_DIR = Path(__file__).resolve().parent
 REPO_ROOT = Path("/app/sqlglot") if Path("/app/sqlglot").exists() else Path("sqlglot").resolve()
 
-# Calibrated EV parameters based on measured Docker CPU vs tests.json durations
+# Calibrated EV parameters (realistic fork/import overhead + CPU speed vs CI workers)
 LIVE_SINGLE_MAX_S = 7.0
-LIVE_COMMIT_MAX_S = 22.0
-LIVE_FIXED_OVERHEAD_S = 0.55
-LIVE_SPEED_FACTOR = 0.72
-GIANT_SPEED_FACTOR = 0.50   # test_execute_tpcds: ~9.7s CPU vs 21.45s tests.json
-LIVE_EV_THRESHOLD = 0.85
-GIANT_EV_THRESHOLD = 0.85
-TOTAL_LIVE_BUDGET_S = 95.0  # Real measured seconds budget
+LIVE_COMMIT_MAX_S = 18.0
+LIVE_FIXED_OVERHEAD_S = 0.70
+LIVE_SPEED_FACTOR = 0.90
+LIVE_EV_THRESHOLD = 0.90
+TOTAL_LIVE_BUDGET_S = 95.0
+
+PEP263_RE = re.compile(r"coding[:=]\s*[-\w.]+")
 
 NEVER_DROP_LIVE_IDS = {
     "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
@@ -135,6 +136,32 @@ def _get_old_ast(rel_file):
     return _AST_CACHE[rel_file]
 
 
+def _diff_expr_for_lambdas(o_node, n_node, changed_lambdas):
+    """Return True if any non-Lambda-body difference exists between two AST subtrees."""
+    if type(o_node) is not type(n_node):
+        return True
+    if not isinstance(o_node, ast.AST):
+        if isinstance(o_node, list):
+            if len(o_node) != len(n_node):
+                return True
+            for x, y in zip(o_node, n_node):
+                if _diff_expr_for_lambdas(x, y, changed_lambdas):
+                    return True
+            return False
+        return o_node != n_node
+    if ast.dump(o_node, include_attributes=False) == ast.dump(n_node, include_attributes=False):
+        return False
+    if isinstance(o_node, ast.Lambda):
+        if ast.dump(o_node.args, include_attributes=False) != ast.dump(n_node.args, include_attributes=False):
+            return True
+        changed_lambdas.add(o_node.lineno)
+        return False
+    for field in o_node._fields:
+        if _diff_expr_for_lambdas(getattr(o_node, field), getattr(n_node, field), changed_lambdas):
+            return True
+    return False
+
+
 def _diff_ast_body(old_body, new_body, changed_def_linenos):
     if len(old_body) != len(new_body):
         return True
@@ -185,14 +212,125 @@ def _diff_ast_body(old_body, new_body, changed_def_linenos):
                 return True
         else:
             if ast.dump(o_stmt, include_attributes=False) != ast.dump(n_stmt, include_attributes=False):
-                return True
+                # Allow edits that ONLY change the body of a lambda (e.g., parser/generator FUNCTIONS/TRANSFORMS dicts)
+                lambdas = set()
+                if not _diff_expr_for_lambdas(o_stmt, n_stmt, lambdas) and lambdas:
+                    changed_def_linenos.update(lambdas)
+                else:
+                    return True
     return False
+
+
+def _changed_top_classes(old_ast, new_ast):
+    if len(old_ast.body) != len(new_ast.body):
+        return None
+    changed = []
+    for o, n in zip(old_ast.body, new_ast.body):
+        if type(o) is not type(n):
+            return None
+        if ast.dump(o, include_attributes=False) == ast.dump(n, include_attributes=False):
+            continue
+        if isinstance(o, ast.ClassDef) and o.name == n.name:
+            changed.append((o, n))
+        else:
+            return None
+    return changed
+
+
+def _dialect_component_only(changed_class_pairs):
+    comp_map = {"Tokenizer": "tok_files", "Parser": "par_files", "Generator": "gen_files"}
+    components = set()
+    for o_cls, n_cls in changed_class_pairs:
+        if len(o_cls.body) != len(n_cls.body):
+            return None
+        for o_s, n_s in zip(o_cls.body, n_cls.body):
+            if type(o_s) is not type(n_s):
+                return None
+            if ast.dump(o_s, include_attributes=False) == ast.dump(n_s, include_attributes=False):
+                continue
+            if isinstance(o_s, ast.ClassDef) and o_s.name == n_s.name and o_s.name in comp_map:
+                components.add(comp_map[o_s.name])
+            else:
+                return None
+    return components if components else None
+
+
+def _stmt_lines_lookup(cfile, old_ast, old_lines, file_lines_map, tm_funcs, idxs_to_nums):
+    """Map changed lines inside function/lambda bodies to enclosing statement entry lines."""
+    if not file_lines_map or not old_lines:
+        return set(), False
+
+    all_stmts = []
+    all_lambdas = []
+    for node in ast.walk(old_ast):
+        if isinstance(node, ast.Lambda):
+            start = getattr(node, "lineno", None)
+            end = getattr(node, "end_lineno", start)
+            if start is not None:
+                all_lambdas.append((end - start, start, end, node))
+        elif isinstance(node, ast.stmt) and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            start = getattr(node, "lineno", None)
+            end = getattr(node, "end_lineno", start)
+            if start is not None:
+                all_stmts.append((end - start, start, end, node))
+
+    selected_nums = set()
+    for ln in old_lines:
+        # Prefer enclosing Lambda if edit is inside a lambda expression
+        lam_enc = [s for s in all_lambdas if s[1] <= ln <= s[2]]
+        if lam_enc:
+            lam_enc.sort(key=lambda x: x[0])
+            _, l_start, l_end, _ = lam_enc[0]
+            fkey = f"{cfile}:{l_start}"
+            if fkey in tm_funcs:
+                selected_nums.update(idxs_to_nums(tm_funcs[fkey]))
+                continue
+            return set(), False
+
+        enclosing = [s for s in all_stmts if s[1] <= ln <= s[2]]
+        if not enclosing:
+            return set(), False
+        enclosing.sort(key=lambda x: x[0])
+        _, s_start, s_end, s_node = enclosing[0]
+
+        body = getattr(s_node, "body", None)
+        if body:
+            h_end = max(s_start, min(getattr(body[0], "lineno", s_end) - 1, s_end))
+            search_range = range(s_start, h_end + 1) if ln <= h_end else range(ln, ln + 1)
+        else:
+            search_range = range(s_start, s_end + 1)
+
+        hit = set()
+        for cand_ln in search_range:
+            k = str(cand_ln)
+            if k in file_lines_map:
+                hit.update(idxs_to_nums(file_lines_map[k]))
+                break
+        if str(ln) in file_lines_map:
+            hit.update(idxs_to_nums(file_lines_map[str(ln)]))
+
+        if not hit:
+            for cand_ln in search_range:
+                k = str(cand_ln)
+                if k in file_lines_map:
+                    hit.update(idxs_to_nums(file_lines_map[k]))
+        if not hit:
+            return set(), False
+        selected_nums.update(hit)
+
+    return selected_nums, bool(selected_nums)
+
+
+def _has_pep263_change(old_text, new_text):
+    old_top = "\n".join(old_text.splitlines()[:2])
+    new_top = "\n".join(new_text.splitlines()[:2])
+    return bool(PEP263_RE.search(old_top) or PEP263_RE.search(new_top)) and (old_top != new_top)
 
 
 def analyze_file_patch(rel_file, info):
     full = REPO_ROOT / rel_file
     if info["is_del"]:
-        return False, False, None, set(), True
+        return False, False, None, set(), True, None, None
     if info["is_new"]:
         new_lines = [hl[1:] for _, _, _, _, hlines in info["hunks"] for hl in hlines if hl.startswith("+")]
         new_text = "\n".join(new_lines) + "\n"
@@ -200,42 +338,42 @@ def analyze_file_patch(rel_file, info):
             try:
                 ast.parse(new_text)
             except SyntaxError:
-                return False, True, new_text, set(), True
-        return False, False, new_text, set(), True
+                return False, True, new_text, set(), True, None, None
+        return False, False, new_text, set(), True, None, None
 
     if not full.exists():
-        return False, False, None, set(), True
+        return False, False, None, set(), True, None, None
 
     if not rel_file.endswith(".py"):
         old_text = full.read_text(encoding="utf-8", errors="ignore")
         new_text = apply_hunks(old_text, info["hunks"])
-        return (old_text == new_text), False, new_text, set(), True
+        return (old_text == new_text), False, new_text, set(), True, None, None
 
     old_text, old_ast = _get_old_ast(rel_file)
     if old_text is None:
-        return False, False, None, set(), True
+        return False, False, None, set(), True, None, None
     new_text = apply_hunks(old_text, info["hunks"])
 
-    if any(ln <= 2 for ln in info["old_lines"]):
+    if _has_pep263_change(old_text, new_text):
         try:
             ast.parse(new_text)
-            return False, False, new_text, set(), True
+            return False, False, new_text, set(), True, old_ast, None
         except SyntaxError:
-            return False, True, new_text, set(), True
+            return False, True, new_text, set(), True, old_ast, None
 
     if old_ast is None:
-        return False, False, new_text, set(), True
+        return False, False, new_text, set(), True, None, None
     try:
         new_ast = ast.parse(new_text)
     except SyntaxError:
-        return False, True, new_text, set(), True
+        return False, True, new_text, set(), True, old_ast, None
 
     if ast.dump(old_ast, include_attributes=False) == ast.dump(new_ast, include_attributes=False):
-        return True, False, new_text, set(), False
+        return True, False, new_text, set(), False, old_ast, new_ast
 
     changed_defs = set()
     outside = _diff_ast_body(old_ast.body, new_ast.body, changed_defs)
-    return False, False, new_text, changed_defs, outside
+    return False, False, new_text, changed_defs, outside, old_ast, new_ast
 
 
 def optimize_workers_with_cost(test_nums, dur_ms):
@@ -403,7 +541,7 @@ def _needs_pickle_roundtrip(patched_files):
     return False
 
 
-def _exec_live_child(patched_files, cand_nums, test_by_num, dur_ms, fail_fast=False):
+def _exec_live_child(patched_files, cand_nums, test_by_num, dur_ms):
     os.environ["HOME"] = "/tmp"
     os.chdir(str(REPO_ROOT))
     src_str = str(SRC_DIR)
@@ -464,13 +602,14 @@ def _exec_live_child(patched_files, cand_nums, test_by_num, dur_ms, fail_fast=Fa
         builtins.open = hooked_open
         io.open = hooked_io_open
 
-    # In fail_fast mode, run cheap tests strictly BEFORE giant tests so any failure aborts immediately
-    if fail_fast:
-        cheap = [n for n in cand_nums if dur_ms[n] <= LIVE_SINGLE_MAX_S * 1000]
-        giant = [n for n in cand_nums if dur_ms[n] > LIVE_SINGLE_MAX_S * 1000]
-        stages = [cheap, giant]
-    else:
-        stages = [list(cand_nums)]
+    grouped = defaultdict(list)
+    for n in sorted(cand_nums, key=lambda x: dur_ms[x]):
+        tid = test_by_num[n]["id"]
+        parts = tid.split("::")
+        mod_name = parts[0][:-3].replace("/", ".")
+        cls_name = parts[1] if len(parts) >= 3 else None
+        method_name = parts[-1]
+        grouped[(mod_name, cls_name)].append((n, method_name))
 
     def _on_alarm(signum, frame):
         raise TimeoutError("live test timed out")
@@ -478,102 +617,68 @@ def _exec_live_child(patched_files, cand_nums, test_by_num, dur_ms, fail_fast=Fa
     signal.signal(signal.SIGALRM, _on_alarm)
     failed = set()
 
-    for stage in stages:
-        if not stage:
+    for (mod_name, cls_name), items in grouped.items():
+        try:
+            mod = importlib.import_module(mod_name)
+        except BaseException:
+            for n, _ in items:
+                failed.add(n)
             continue
-        # Group by (mod_name, cls_name) ordered by shortest test first
-        grouped = defaultdict(list)
-        for n in sorted(stage, key=lambda x: dur_ms[x]):
-            tid = test_by_num[n]["id"]
-            parts = tid.split("::")
-            mod_name = parts[0][:-3].replace("/", ".")
-            cls_name = parts[1] if len(parts) >= 3 else None
-            method_name = parts[-1]
-            grouped[(mod_name, cls_name)].append((n, method_name))
 
-        # Order groups by total duration ascending so fast classes run first in fail_fast
-        ordered_groups = sorted(
-            grouped.items(),
-            key=lambda kv: sum(dur_ms[n] for n, _ in kv[1]),
-        )
-
-        for (mod_name, cls_name), items in ordered_groups:
-            try:
-                mod = importlib.import_module(mod_name)
-            except BaseException:
-                for n, _ in items:
-                    failed.add(n)
-                if fail_fast:
-                    return {"aborted": True, "failed": sorted(failed)}
-                continue
-
-            if cls_name is None:
-                for n, fn_name in items:
-                    timeout = max(3, int((dur_ms[n] / 1000.0) * 3 + 3))
-                    signal.alarm(timeout)
-                    try:
-                        getattr(mod, fn_name)()
-                    except BaseException:
-                        failed.add(n)
-                    finally:
-                        signal.alarm(0)
-                    if fail_fast and failed:
-                        return {"aborted": True, "failed": sorted(failed)}
-                continue
-
-            cls = getattr(mod, cls_name, None)
-            if cls is None:
-                for n, _ in items:
-                    failed.add(n)
-                if fail_fast:
-                    return {"aborted": True, "failed": sorted(failed)}
-                continue
-
-            try:
-                if hasattr(cls, "setUpClass"):
-                    cls.setUpClass()
-            except BaseException:
-                for n, _ in items:
-                    failed.add(n)
-                if fail_fast:
-                    return {"aborted": True, "failed": sorted(failed)}
-                continue
-
-            for n, method_name in items:
+        if cls_name is None:
+            for n, fn_name in items:
                 timeout = max(3, int((dur_ms[n] / 1000.0) * 3 + 3))
                 signal.alarm(timeout)
                 try:
-                    tc = cls(method_name)
-                    res = unittest.TestResult()
-                    tc.run(res)
-                    if not res.wasSuccessful():
-                        failed.add(n)
+                    getattr(mod, fn_name)()
                 except BaseException:
                     failed.add(n)
                 finally:
                     signal.alarm(0)
-                if fail_fast and failed:
-                    try:
-                        if hasattr(cls, "tearDownClass"):
-                            cls.tearDownClass()
-                    except BaseException:
-                        pass
-                    return {"aborted": True, "failed": sorted(failed)}
+            continue
 
+        cls = getattr(mod, cls_name, None)
+        if cls is None:
+            for n, _ in items:
+                failed.add(n)
+            continue
+
+        try:
+            if hasattr(cls, "setUpClass"):
+                cls.setUpClass()
+        except BaseException:
+            for n, _ in items:
+                failed.add(n)
+            continue
+
+        for n, method_name in items:
+            timeout = max(3, int((dur_ms[n] / 1000.0) * 3 + 3))
+            signal.alarm(timeout)
             try:
-                if hasattr(cls, "tearDownClass"):
-                    cls.tearDownClass()
+                tc = cls(method_name)
+                res = unittest.TestResult()
+                tc.run(res)
+                if not res.wasSuccessful():
+                    failed.add(n)
             except BaseException:
-                pass
+                failed.add(n)
+            finally:
+                signal.alarm(0)
 
-    return {"aborted": False, "failed": sorted(failed)}
+        try:
+            if hasattr(cls, "tearDownClass"):
+                cls.tearDownClass()
+        except BaseException:
+            pass
+
+    return sorted(failed)
 
 
-def run_live_tests(patched_files, cand_nums, test_by_num, dur_ms, fail_fast=False):
+def run_live_tests(patched_files, cand_nums, test_by_num, dur_ms):
     if not hasattr(os, "fork") or not REPO_ROOT.exists():
-        return None, False
+        return None
     if any(v is None for v in patched_files.values()):
-        return None, False
+        return None
 
     read_fd, write_fd = os.pipe()
     pid = os.fork()
@@ -590,8 +695,8 @@ def run_live_tests(patched_files, cand_nums, test_by_num, dur_ms, fail_fast=Fals
             pass
 
         try:
-            res = _exec_live_child(patched_files, cand_nums, test_by_num, dur_ms, fail_fast=fail_fast)
-            payload = json.dumps({"ok": True, "aborted": res["aborted"], "failed": res["failed"]}).encode("utf-8")
+            failed = _exec_live_child(patched_files, cand_nums, test_by_num, dur_ms)
+            payload = json.dumps({"ok": True, "failed": failed}).encode("utf-8")
         except BaseException:
             payload = json.dumps({"ok": False}).encode("utf-8")
 
@@ -613,14 +718,14 @@ def run_live_tests(patched_files, cand_nums, test_by_num, dur_ms, fail_fast=Fals
         os.waitpid(pid, 0)
         raw = b"".join(chunks)
         if not raw:
-            return None, False
+            return None
         try:
             data = json.loads(raw.decode("utf-8"))
             if data.get("ok"):
-                return set(data["failed"]), bool(data.get("aborted", False))
+                return set(data["failed"])
         except Exception:
             pass
-        return None, False
+        return None
 
 
 def _preload_heavy_third_party():
@@ -631,6 +736,15 @@ def _preload_heavy_third_party():
             importlib.import_module(mod)
         except Exception:
             pass
+
+
+def _load_test_map():
+    gz_path = SRC_DIR / "test_map.json.gz"
+    if gz_path.exists():
+        with gzip.open(gz_path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    with open(SRC_DIR / "test_map.json", "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def main():
@@ -651,13 +765,12 @@ def main():
         if t["id"] in NEVER_DROP_LIVE_IDS or t["file"] in NEVER_DROP_LIVE_FILES
     }
 
-    tm_path = SRC_DIR / "test_map.json"
-    with open(tm_path, "r", encoding="utf-8") as f:
-        tm = json.load(f)
-
+    tm = _load_test_map()
     tm_tests = tm["tests"]
     tm_files = tm["files"]
     tm_funcs = tm["funcs"]
+    tm_lines = tm.get("lines", {})
+    tm_exprs = tm.get("exprs", {})
     tm_fixtures = tm["fixtures"]
 
     def idxs_to_nums(idxs):
@@ -684,7 +797,7 @@ def main():
         non_noop_count = 0
 
         for cfile, finfo in pinfo.items():
-            is_noop, syn_err, new_text, changed_defs, outside_def = analyze_file_patch(cfile, finfo)
+            is_noop, syn_err, new_text, changed_defs, outside_def, old_ast, new_ast = analyze_file_patch(cfile, finfo)
             if is_noop:
                 continue
 
@@ -719,11 +832,15 @@ def main():
                             fc.update(t["number"] for t in tests if t["file"] == tgt)
                 candidates.update(fc)
                 fixture_cands.update(fc)
-            else:
-                if cfile.endswith(".py") and cfile.startswith("sqlglot/"):
-                    if syn_err or finfo["is_new"] or finfo["is_del"] or outside_def or not changed_defs:
-                        f_cands = idxs_to_nums(tm_files.get(cfile, []))
-                        candidates.update(f_cands if f_cands else all_nums)
+            elif cfile.endswith(".py") and cfile.startswith("sqlglot/"):
+                if not syn_err and not finfo["is_new"] and not finfo["is_del"] and not outside_def and changed_defs:
+                    # 1. Statement-level line coverage inside modified function/lambda bodies
+                    l_nums, l_ok = (
+                        _stmt_lines_lookup(cfile, old_ast, finfo["old_lines"], tm_lines.get(cfile), tm_funcs, idxs_to_nums)
+                        if old_ast is not None else (set(), False)
+                    )
+                    if l_ok and l_nums:
+                        candidates.update(l_nums)
                     else:
                         missing_from_map = False
                         for dln in changed_defs:
@@ -735,15 +852,48 @@ def main():
                         if missing_from_map:
                             f_cands = idxs_to_nums(tm_files.get(cfile, []))
                             candidates.update(f_cands if f_cands else all_nums)
-                elif cfile.startswith("tests/"):
-                    if cfile in tm_files:
-                        candidates.update(idxs_to_nums(tm_files[cfile]))
+                elif not syn_err and not finfo["is_new"] and not finfo["is_del"] and old_ast is not None and new_ast is not None:
+                    # 2. Class-body edits: Expression subclass or Dialect Tokenizer/Parser/Generator narrowing
+                    changed_classes = _changed_top_classes(old_ast, new_ast)
+                    narrowed = set()
+                    if changed_classes and cfile.startswith("sqlglot/expressions/"):
+                        keys = [f"{cfile}:{o_cls.name}" for o_cls, _ in changed_classes]
+                        if all(k in tm_exprs for k in keys):
+                            for k in keys:
+                                narrowed.update(idxs_to_nums(tm_exprs[k]))
+                    elif changed_classes and cfile.startswith("sqlglot/dialects/"):
+                        comps = _dialect_component_only(changed_classes)
+                        if comps:
+                            comp_cands = set()
+                            ok_comp = True
+                            for comp_key in comps:
+                                cmap = tm.get(comp_key, {})
+                                if cfile in cmap and cmap[cfile]:
+                                    comp_cands.update(idxs_to_nums(cmap[cfile]))
+                                else:
+                                    ok_comp = False
+                            if ok_comp and comp_cands:
+                                narrowed.update(comp_cands)
+
+                    if narrowed:
+                        candidates.update(narrowed)
                     else:
-                        candidates.update(t["number"] for t in tests if t["file"] == cfile)
-                elif cfile in tm_files:
+                        f_cands = idxs_to_nums(tm_files.get(cfile, []))
+                        candidates.update(f_cands if f_cands else all_nums)
+                else:
+                    f_cands = idxs_to_nums(tm_files.get(cfile, []))
+                    candidates.update(f_cands if f_cands else all_nums)
+            elif cfile.startswith("tests/"):
+                if cfile in tm_files:
                     candidates.update(idxs_to_nums(tm_files[cfile]))
-                elif cfile in tm_fixtures:
-                    candidates.update(idxs_to_nums(tm_fixtures[cfile]))
+                else:
+                    candidates.update(t["number"] for t in tests if t["file"] == cfile)
+            elif cfile in tm_files:
+                candidates.update(idxs_to_nums(tm_files[cfile]))
+            elif cfile in tm_fixtures:
+                candidates.update(idxs_to_nums(tm_fixtures[cfile]))
+            else:
+                candidates.update(all_nums)
 
         if non_noop_count == 0 or not candidates:
             print(json.dumps({"commit": commit_id, "workers": []}), flush=True)
@@ -752,22 +902,22 @@ def main():
         final_nums = candidates
         if not any_syn_err and live_budget_used_s < TOTAL_LIVE_BUDGET_S:
             _, static_cost_ms = optimize_workers_with_cost(candidates, dur_ms)
-            hard_blind = fixture_cands | (candidates & never_drop_nums)
-            giants = {n for n in candidates if dur_ms[n] > LIVE_SINGLE_MAX_S * 1000} - hard_blind
+            keep_blind = (
+                {n for n in candidates if dur_ms[n] > LIVE_SINGLE_MAX_S * 1000}
+                | fixture_cands
+                | (candidates & never_drop_nums)
+            )
+            maybe_live = sorted((candidates - keep_blind), key=lambda n: dur_ms[n])
 
-            if False and giants and not hard_blind:
-                # Mode A: Fail-fast giant check (e.g., commits hitting test_execute_tpcds)
-                # Runs cheap tests first; aborts immediately on first failure (safe static fallback).
-                # Only runs giant test if all cheap tests pass -> drops entire commit to 0.000s!
-                cheap_nums = candidates - giants
-                cheap_sum_s = sum(dur_ms[n] for n in cheap_nums) / 1000.0
-                giant_sum_s = sum(dur_ms[n] for n in giants) / 1000.0
-                est_cpu_s = LIVE_FIXED_OVERHEAD_S + LIVE_SPEED_FACTOR * cheap_sum_s + GIANT_SPEED_FACTOR * giant_sum_s
-                max_savings_s = static_cost_ms / 1000.0
+            if maybe_live:
+                _, blind_cost_ms = optimize_workers_with_cost(keep_blind, dur_ms)
+                live_sum_s = sum(dur_ms[n] for n in maybe_live) / 1000.0
+                expected_savings_s = (static_cost_ms - blind_cost_ms) / 1000.0 - (0.45 * (2.0 + 0.50 * live_sum_s) if not keep_blind else 0.45 * 0.50 * live_sum_s)
+                est_cpu_s = LIVE_FIXED_OVERHEAD_S + LIVE_SPEED_FACTOR * live_sum_s
 
                 if (
-                    cheap_sum_s <= LIVE_COMMIT_MAX_S
-                    and est_cpu_s < GIANT_EV_THRESHOLD * max_savings_s
+                    live_sum_s <= LIVE_COMMIT_MAX_S
+                    and est_cpu_s < LIVE_EV_THRESHOLD * expected_savings_s
                     and live_budget_used_s + est_cpu_s <= TOTAL_LIVE_BUDGET_S
                 ):
                     if not preloaded:
@@ -775,46 +925,16 @@ def main():
                         preloaded = True
                     live_calls += 1
                     t0 = time.perf_counter()
-                    failed_live, aborted = run_live_tests(
-                        patched_files, sorted(candidates, key=lambda n: dur_ms[n]), test_by_num, dur_ms, fail_fast=True
-                    )
+                    failed_live = run_live_tests(patched_files, maybe_live, test_by_num, dur_ms)
                     dt = time.perf_counter() - t0
                     live_budget_used_s += dt
-                    status = "ABORT" if aborted else (str(len(failed_live)) if failed_live is not None else "NONE")
-                    print(f"[live-giant] {commit_id}: {len(candidates)}->{status} ({dt:.2f}s)", file=sys.stderr, flush=True)
-                    if failed_live is not None and not aborted:
-                        final_nums = failed_live
-            else:
-                # Mode B: Standard live filtering on non-giant tests with honest EV gate
-                keep_blind = hard_blind | giants
-                maybe_live = sorted((candidates - keep_blind), key=lambda n: dur_ms[n])
-
-                if maybe_live:
-                    _, blind_cost_ms = optimize_workers_with_cost(keep_blind, dur_ms)
-                    max_savings_s = (static_cost_ms - blind_cost_ms) / 1000.0 - (0.90 if not keep_blind else 0.0)
-                    live_sum_s = sum(dur_ms[n] for n in maybe_live) / 1000.0
-                    est_cpu_s = LIVE_FIXED_OVERHEAD_S + LIVE_SPEED_FACTOR * live_sum_s
-
-                    if (
-                        live_sum_s <= LIVE_COMMIT_MAX_S
-                        and est_cpu_s < LIVE_EV_THRESHOLD * max_savings_s
-                        and live_budget_used_s + est_cpu_s <= TOTAL_LIVE_BUDGET_S
-                    ):
-                        if not preloaded:
-                            _preload_heavy_third_party()
-                            preloaded = True
-                        live_calls += 1
-                        t0 = time.perf_counter()
-                        failed_live, _ = run_live_tests(patched_files, maybe_live, test_by_num, dur_ms, fail_fast=False)
-                        dt = time.perf_counter() - t0
-                        live_budget_used_s += dt
-                        print(
-                            f"[live] {commit_id}: {len(maybe_live)}->{len(failed_live) if failed_live is not None else 'NONE'} ({dt:.2f}s)",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        if failed_live is not None:
-                            final_nums = keep_blind | failed_live
+                    print(
+                        f"[live] {commit_id}: {len(maybe_live)}->{len(failed_live) if failed_live is not None else 'NONE'} ({dt:.2f}s)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if failed_live is not None:
+                        final_nums = keep_blind | failed_live
 
         workers, _ = optimize_workers_with_cost(final_nums, dur_ms)
         print(json.dumps({"commit": commit_id, "workers": workers}), flush=True)
