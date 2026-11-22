@@ -1,4 +1,5 @@
 ﻿import ast
+import gc
 import builtins
 import concurrent.futures
 import glob
@@ -30,10 +31,27 @@ REPO_ROOT = Path("/app/sqlglot") if Path("/app/sqlglot").exists() else Path("sql
 # Calibrated EV parameters (realistic fork/import overhead + CPU speed vs CI workers)
 LIVE_SINGLE_MAX_S = 7.0
 LIVE_COMMIT_MAX_S = 18.0
-LIVE_FIXED_OVERHEAD_S = 0.70
-LIVE_SPEED_FACTOR = 0.90
+LIVE_FIXED_OVERHEAD_S = 0.45
+LIVE_SPEED_FACTOR = 0.85
 LIVE_EV_THRESHOLD = 0.90
 TOTAL_LIVE_BUDGET_S = 95.0
+
+# Measured Docker live CPU (keyed by pytest nodeid so test numbering cannot drift)
+LIVE_CPU_OVERRIDE_BY_ID = {
+    # Fast-live bargains (much faster live than CI sim)
+    "tests/test_generator.py::TestGenerator::test_generator_memory": 1.60,
+    "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries": 0.45,
+    # Pure-Python traps (much slower live than CI sim)
+    "tests/test_optimizer.py::TestOptimizer::test_tpcds": 16.50,
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_columns": 13.50,
+    "tests/test_optimizer.py::TestOptimizer::test_simplify": 12.70,
+    "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries": 11.70,
+    "tests/test_optimizer.py::TestOptimizer::test_canonicalize": 10.90,
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": 8.50,
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch": 4.60,
+    "tests/test_optimizer.py::TestOptimizer::test_scope": 3.50,
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs": 2.45,
+}
 
 PEP263_RE = re.compile(r"coding[:=]\s*[-\w.]+")
 
@@ -495,6 +513,25 @@ def _is_safe_identity_eq(cmp_node, cls_node, func_node, old_ast, unsafe_imports)
                 return True
             if isinstance(other, ast.Attribute) and isinstance(other.value, ast.Name) and other.value.id == "self" and other.attr in safe_self_attrs:
                 return True
+            # Class-level handler dict comprehension: TRANSFORMS = {k: v for k, v in {...}.items() if v is not None}
+            if cls_node is not None and func_node is None and isinstance(other, ast.Name):
+                for stmt in cls_node.body:
+                    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                        aname = stmt.targets[0].id
+                        if aname in ("TRANSFORMS", "FUNCTIONS") or aname.endswith("_PARSERS"):
+                            if isinstance(stmt.value, ast.DictComp):
+                                for gen in stmt.value.generators:
+                                    if (
+                                        isinstance(gen.target, ast.Tuple)
+                                        and len(gen.target.elts) == 2
+                                        and isinstance(gen.target.elts[1], ast.Name)
+                                        and gen.target.elts[1].id == other.id
+                                        and isinstance(gen.iter, ast.Call)
+                                        and isinstance(gen.iter.func, ast.Attribute)
+                                        and gen.iter.func.attr == "items"
+                                        and any(cmp_node is f or any(x is cmp_node for x in ast.walk(f)) for f in gen.ifs)
+                                    ):
+                                        return True
         elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id[:1].isupper() and target.attr.isupper():
             enum_name = target.value.id
             ekind = _enum_class_kind(enum_name, old_ast)
@@ -615,15 +652,73 @@ def _get_import_time_attrs():
     return found
 
 
-def _attr_defuse_narrow(attr_names, base_nums, tm_files, tm_funcs, tm_lines, idxs_to_nums):
-    """Narrow non-import-time ALL_CAPS class attribute edits via static def-use + line coverage."""
+DERIVED_IMP_ATTRS = {
+    "TIME_MAPPING": {
+        "TIME_MAPPING", "TIME_TRIE", "FORMAT_TRIE",
+        "INVERSE_TIME_MAPPING", "INVERSE_TIME_TRIE",
+        "MYSQL_INVERSE_TIME_MAPPING", "MYSQL_INVERSE_TIME_TRIE",
+    },
+    "FORMAT_MAPPING": {
+        "FORMAT_MAPPING", "FORMAT_TRIE",
+        "INVERSE_FORMAT_MAPPING", "INVERSE_FORMAT_TRIE",
+    },
+    "INVERSE_TIME_MAPPING": {
+        "INVERSE_TIME_MAPPING", "INVERSE_TIME_TRIE",
+        "MYSQL_INVERSE_TIME_MAPPING", "MYSQL_INVERSE_TIME_TRIE",
+    },
+    "CREATABLE_KIND_MAPPING": {
+        "CREATABLE_KIND_MAPPING", "INVERSE_CREATABLE_KIND_MAPPING",
+    },
+}
+
+
+def _is_safe_derived_dict_rhs(changed_class_pairs, cattrs):
+    """Verify RHS of modified derived-mapping attrs is a dict / dict-merge so _Dialect.__new__ won't crash."""
+    if not any(a in DERIVED_IMP_ATTRS for a in cattrs):
+        return False
+
+    def _is_dict_expr(node):
+        if isinstance(node, ast.Dict):
+            return True
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return _is_dict_expr(node.left) or _is_dict_expr(node.right)
+        return False
+
+    def _check_body(obody, nbody):
+        for o_s, n_s in zip(obody, nbody):
+            if ast.dump(o_s, include_attributes=False) == ast.dump(n_s, include_attributes=False):
+                continue
+            if isinstance(n_s, ast.Assign) and len(n_s.targets) == 1 and isinstance(n_s.targets[0], ast.Name):
+                if n_s.targets[0].id in DERIVED_IMP_ATTRS and not _is_dict_expr(n_s.value):
+                    return False
+            elif isinstance(n_s, ast.AnnAssign) and isinstance(n_s.target, ast.Name):
+                if n_s.target.id in DERIVED_IMP_ATTRS and not _is_dict_expr(n_s.value):
+                    return False
+            elif isinstance(n_s, ast.ClassDef) and isinstance(o_s, ast.ClassDef):
+                if not _check_body(o_s.body, n_s.body):
+                    return False
+        return True
+
+    return all(_check_body(o.body, n.body) for o, n in changed_class_pairs)
+
+
+def _attr_defuse_narrow(attr_names, base_nums, tm_files, tm_funcs, tm_lines, idxs_to_nums, allow_derived=False):
+    """Narrow non-import-time (and verified Dialect.__new__ derived) ALL_CAPS class attribute edits via static def-use."""
     imp_attrs = _get_import_time_attrs()
-    if any(a in imp_attrs for a in attr_names):
-        return None
+    search_attrs = set()
+    used_derived = False
+    for a in attr_names:
+        if allow_derived and a in DERIVED_IMP_ATTRS:
+            search_attrs.update(DERIVED_IMP_ATTRS[a])
+            used_derived = True
+        elif a in imp_attrs:
+            return None
+        else:
+            search_attrs.add(a)
 
     ref_nums = set()
     direct_test_nums = set()
-    for attr in attr_names:
+    for attr in search_attrs:
         q1, q2 = f'"{attr}"', f"'{attr}'"
         for folder in ("sqlglot", "tests"):
             root = REPO_ROOT / folder
@@ -634,37 +729,47 @@ def _attr_defuse_narrow(attr_names, base_nums, tm_files, tm_funcs, tm_lines, idx
                 txt = p.read_text(encoding="utf-8", errors="ignore")
                 if attr not in txt:
                     continue
-                if q1 in txt or q2 in txt:
-                    return None
                 if folder == "tests":
+                    if q1 in txt or q2 in txt:
+                        return None
                     if rel not in tm_files:
                         return None
                     direct_test_nums.update(idxs_to_nums(tm_files[rel]))
                     continue
                 _, tree = _get_old_ast(rel)
-                if q1 in txt or q2 in txt:
-                    return None
                 if tree is None:
                     return None
 
-                if folder == "tests":
-                    if rel not in tm_files:
-                        return None
-                    direct_test_nums.update(idxs_to_nums(tm_files[rel]))
-                    continue
-
-                # Collect class-body LHS definition target ids so we skip pure definitions
+                # Collect class-body LHS definition target ids & subclass inheritance spans
                 def_target_ids = set()
+                inherit_spans = []
+                dialect_new_spans = []
                 for n in ast.walk(tree):
                     if isinstance(n, ast.ClassDef):
                         for stmt in n.body:
+                            tname = None
                             if isinstance(stmt, ast.Assign):
                                 for t in stmt.targets:
                                     if isinstance(t, ast.Name) and t.id == attr:
                                         def_target_ids.add(id(t))
+                                if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                                    tname = stmt.targets[0].id
                             elif isinstance(stmt, ast.AnnAssign):
                                 if isinstance(stmt.target, ast.Name) and stmt.target.id == attr:
                                     def_target_ids.add(id(stmt.target))
+                                if isinstance(stmt.target, ast.Name):
+                                    tname = stmt.target.id
+                            if used_derived and tname in search_attrs:
+                                s = getattr(stmt, "lineno", None)
+                                e = getattr(stmt, "end_lineno", s)
+                                if s is not None:
+                                    inherit_spans.append((s, e))
+                            if used_derived and rel == "sqlglot/dialects/dialect.py" and n.name == "_Dialect":
+                                if isinstance(stmt, ast.FunctionDef) and stmt.name == "__new__":
+                                    s = getattr(stmt, "lineno", None)
+                                    e = getattr(stmt, "end_lineno", s)
+                                    if s is not None:
+                                        dialect_new_spans.append((s, e))
 
                 # Collect function/lambda spans to verify every reference is runtime (not import-time)
                 func_spans = []
@@ -674,6 +779,14 @@ def _attr_defuse_narrow(attr_names, base_nums, tm_files, tm_funcs, tm_lines, idx
                         e = getattr(n, "end_lineno", s)
                         if s is not None:
                             func_spans.append((s, e, n.lineno))
+
+                # Bail if attr appears as a string literal outside _Dialect.__new__ (dynamic getattr/dict lookup)
+                if q1 in txt or q2 in txt:
+                    for n in ast.walk(tree):
+                        if isinstance(n, ast.Constant) and n.value == attr:
+                            ln = getattr(n, "lineno", None)
+                            if not (used_derived and ln is not None and any(s <= ln <= e for s, e in dialect_new_spans)):
+                                return None
 
                 ref_lines = set()
                 for n in ast.walk(tree):
@@ -685,6 +798,10 @@ def _attr_defuse_narrow(attr_names, base_nums, tm_files, tm_funcs, tm_lines, idx
                     ln = getattr(n, "lineno", None)
                     if ln is None:
                         return None
+                    if used_derived and any(s <= ln <= e for s, e in dialect_new_spans):
+                        continue
+                    if used_derived and any(s <= ln <= e for s, e in inherit_spans):
+                        continue
                     enc = [fs for fs in func_spans if fs[0] <= ln <= fs[1]]
                     if not enc:
                         return None  # module/class-level read -> import-time dependency!
@@ -697,7 +814,6 @@ def _attr_defuse_narrow(attr_names, base_nums, tm_files, tm_funcs, tm_lines, idx
                         if l_ok:
                             ref_nums.update(l_nums)
                         else:
-                            # If enclosing function was traced and line wasn't hit -> 0 tests reached it; else fallback
                             enc_f = [fs[2] for fs in func_spans if fs[0] <= ln <= fs[1]]
                             if any(f"{rel}:{fln}" in tm_funcs for fln in enc_f):
                                 continue
@@ -886,14 +1002,78 @@ def _changed_str_dict_keys(changed_class_pairs):
     return hits if hits else None
 
 
+def _parse_sql_fixture_pairs_safe(text):
+    """Mirror tests/helpers.py:load_sql_fixture_pairs; return None if metadata syntax could fail."""
+    lines = [line for line in text.splitlines() if line and not line.startswith("--")]
+    statements = "\n".join(lines).split(";")
+    size = len(statements)
+    pairs = []
+    for i in range(0, size, 2):
+        if i + 1 < size:
+            sql = statements[i].strip()
+            meta = {}
+            sql_lines = sql.split("\n")
+            j = 0
+            while j < len(sql_lines) and sql_lines[j].startswith("#"):
+                if ":" not in sql_lines[j]:
+                    return None
+                k, v = sql_lines[j].split(":", maxsplit=1)
+                meta[k.lstrip("#").strip()] = v.strip()
+                j += 1
+            if j >= len(sql_lines):
+                return None
+            sql_body = "\n".join(sql_lines[j:])
+            expected = statements[i + 1].strip()
+            pairs.append((meta, sql_body, expected))
+    return pairs
+
+
+def _is_provably_uncovered_func_edit(cfile, old_ast, dln, old_lines, tm_files, tm_funcs, tm_lines):
+    """True iff every test touching cfile traced `def` at dln under sys.monitoring,
+    the edit is strictly inside the function body, and 0 tests ever entered it."""
+    if old_ast is None or cfile not in tm_files or not tm_files[cfile]:
+        return False
+    if f"{cfile}:{dln}" in tm_funcs:
+        return False
+    flm = tm_lines.get(cfile)
+    if not flm or str(dln) not in flm:
+        return False
+    if not set(tm_files[cfile]).issubset(set(flm[str(dln)])):
+        return False
+    target = None
+    for node in ast.walk(old_ast):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.lineno == dln:
+            target = node
+            break
+    if target is None or not target.body:
+        return False
+    body_start = target.body[0].lineno
+    body_end = getattr(target, "end_lineno", body_start)
+    if not old_lines or not all(body_start <= ln <= body_end for ln in old_lines):
+        return False
+    for ln in range(body_start, body_end + 1):
+        if str(ln) in flm and flm[str(ln)]:
+            return False
+    for child in ast.walk(target):
+        if child is not target and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if f"{cfile}:{child.lineno}" in tm_funcs:
+                return False
+    return True
+
+
 def _changed_exp_dict_keys(changed_class_pairs):
     """If class edits ONLY change values for existing exp.Foo keys in class-level dicts, return (dict_names, exp_names)."""
+    return _changed_exp_dict_keys_in_bodies([(o.body, n.body) for o, n in changed_class_pairs])
+
+
+def _changed_exp_dict_keys_in_bodies(body_pairs):
+    """If body edits ONLY change values for exp.Foo keys in dict assignments, return (dict_names, exp_names)."""
     dict_names = set()
     exp_names = set()
-    for o_cls, n_cls in changed_class_pairs:
-        if len(o_cls.body) != len(n_cls.body):
+    for o_body, n_body in body_pairs:
+        if len(o_body) != len(n_body):
             return None
-        for o_s, n_s in zip(o_cls.body, n_cls.body):
+        for o_s, n_s in zip(o_body, n_body):
             if type(o_s) is not type(n_s):
                 return None
             if ast.dump(o_s, include_attributes=False) == ast.dump(n_s, include_attributes=False):
@@ -1328,6 +1508,7 @@ def run_live_tests(patched_files, cand_nums, test_by_num, dur_ms):
     if any(v is None for v in patched_files.values()):
         return None
 
+    gc.freeze()
     read_fd, write_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
@@ -1434,6 +1615,8 @@ def main():
                 out.add(id_to_num[tid])
         return out
 
+    gc.collect()
+    gc.freeze()
     patch_paths = sorted(glob.glob(os.path.join(data_dir, "commits", "*.patch")))
     live_budget_used_s = 0.0
     live_calls = 0
@@ -1463,6 +1646,30 @@ def main():
                 fc = set()
                 if cfile in tm_fixtures:
                     fc.update(idxs_to_nums(tm_fixtures[cfile]))
+                    if (
+                        cfile in ("tests/fixtures/optimizer/tpc-h/tpc-h.sql", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql")
+                        and not finfo["is_new"]
+                        and not finfo["is_del"]
+                    ):
+                        old_pairs = _parse_sql_fixture_pairs_safe((REPO_ROOT / cfile).read_text(encoding="utf-8", errors="ignore"))
+                        new_pairs = _parse_sql_fixture_pairs_safe(new_text)
+                        if old_pairs is not None and new_pairs is not None and len(old_pairs) == len(new_pairs):
+                            sql_or_meta_chg = any(op[0] != np[0] or op[1] != np[1] for op, np in zip(old_pairs, new_pairs))
+                            exp_chg = any(op[2] != np[2] for op, np in zip(old_pairs, new_pairs))
+                            allowed_exec = set()
+                            if cfile.endswith("tpc-h.sql"):
+                                if sql_or_meta_chg or exp_chg:
+                                    allowed_exec.add("tests/test_executor.py::TestExecutor::test_optimized_tpch")
+                                if sql_or_meta_chg:
+                                    allowed_exec.add("tests/test_executor.py::TestExecutor::test_execute_tpch")
+                            else:
+                                if sql_or_meta_chg:
+                                    allowed_exec.add("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+                            fc = {
+                                n for n in fc
+                                if test_by_num[n]["file"] != "tests/test_executor.py"
+                                or test_by_num[n]["id"] in allowed_exec
+                            }
                 else:
                     stem = Path(cfile).stem.lower()
                     base = stem.split("__")[0].rstrip("s")
@@ -1500,6 +1707,8 @@ def main():
                             key = f"{cfile}:{dln}"
                             if key in tm_funcs:
                                 candidates.update(idxs_to_nums(tm_funcs[key]))
+                            elif _is_provably_uncovered_func_edit(cfile, old_ast, dln, finfo["old_lines"], tm_files, tm_funcs, tm_lines):
+                                continue
                             else:
                                 missing_from_map = True
                         if missing_from_map:
@@ -1529,8 +1738,12 @@ def main():
                                 narrowed.update(comp_cands)
 
                     base_cands = narrowed if narrowed else idxs_to_nums(tm_files.get(cfile, []))
-                    if changed_classes and base_cands and cfile.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/generator.py", "sqlglot/parser.py", "sqlglot/typing/")):
-                        exp_dict_res = _changed_exp_dict_keys(changed_classes)
+                    if base_cands and cfile.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/generator.py", "sqlglot/parser.py", "sqlglot/typing/", "sqlglot/optimizer/")):
+                        exp_dict_res = (
+                            _changed_exp_dict_keys(changed_classes)
+                            if changed_classes
+                            else _changed_exp_dict_keys_in_bodies([(old_ast.body, new_ast.body)])
+                        )
                         if exp_dict_res:
                             dnames, enames = exp_dict_res
                             if all(en in expr_by_name for en in enames):
@@ -1542,20 +1755,18 @@ def main():
                                     inter |= {t["number"] for t in tests if t["file"] == "tests/test_typing.py"}
                                 if inter:
                                     base_cands = inter
-                        else:
+                        elif changed_classes:
                             sdict_hits = _changed_str_dict_keys(changed_classes)
                             if sdict_hits and tm_dict_keys:
                                 dk_nums = set()
                                 all_ok = True
                                 for cname, dname, sk in sdict_hits:
-                                    # Check exact class and any nested Parser/Tokenizer/Generator class
                                     matched_key = False
                                     for prefix in (f"{cfile}:{cname}.{dname}:{sk}", f"{cfile}:Parser.{dname}:{sk}", f"{cfile}:Tokenizer.{dname}:{sk}", f"{cfile}:Generator.{dname}:{sk}"):
                                         if prefix in tm_dict_keys and tm_dict_keys[prefix]:
                                             dk_nums.update(idxs_to_nums(tm_dict_keys[prefix]))
                                             matched_key = True
                                     if not matched_key:
-                                        # Also check suffixed keys like "sqlglot/parsers/foo.py:FooParser.FUNCTIONS:BAR"
                                         for dk, idxs in tm_dict_keys.items():
                                             if dk.startswith(f"{cfile}:") and dk.endswith(f".{dname}:{sk}") and idxs:
                                                 dk_nums.update(idxs_to_nums(idxs))
@@ -1568,7 +1779,8 @@ def main():
                                     base_cands = base_cands & dk_nums
                             cattrs = _changed_all_caps_class_attrs(changed_classes)
                             if cattrs:
-                                du = _attr_defuse_narrow(cattrs, base_cands, tm_files, tm_funcs, tm_lines, idxs_to_nums)
+                                allow_der = _is_safe_derived_dict_rhs(changed_classes, cattrs)
+                                du = _attr_defuse_narrow(cattrs, base_cands, tm_files, tm_funcs, tm_lines, idxs_to_nums, allow_derived=allow_der)
                                 if du:
                                     base_cands = du
                     candidates.update(base_cands if base_cands else all_nums)
@@ -1606,44 +1818,81 @@ def main():
 
         final_nums = candidates
         if not any_syn_err and live_budget_used_s < TOTAL_LIVE_BUDGET_S:
+            def _est_live_cpu(n):
+                tid = test_by_num[n]["id"]
+                if tid in LIVE_CPU_OVERRIDE_BY_ID:
+                    return LIVE_CPU_OVERRIDE_BY_ID[tid]
+                return LIVE_SPEED_FACTOR * (dur_ms[n] / 1000.0)
+
             _, static_cost_ms = optimize_workers_with_cost(candidates, dur_ms)
             keep_blind = (
-                {n for n in candidates if dur_ms[n] > LIVE_SINGLE_MAX_S * 1000}
+                {
+                    n for n in candidates
+                    if _est_live_cpu(n) > LIVE_SINGLE_MAX_S
+                    or (dur_ms[n] > 0 and _est_live_cpu(n) > 1.8 * (dur_ms[n] / 1000.0))
+                }
                 | fixture_cands
                 | (candidates & never_drop_nums)
             )
             maybe_live = sorted((candidates - keep_blind), key=lambda n: dur_ms[n])
 
+            to_run = None
+            untested = None
             if maybe_live:
                 _, blind_cost_ms = optimize_workers_with_cost(keep_blind, dur_ms)
-                live_sum_s = sum(dur_ms[n] for n in maybe_live) / 1000.0
-                expected_savings_s = (static_cost_ms - blind_cost_ms) / 1000.0 - (0.45 * (2.0 + 0.50 * live_sum_s) if not keep_blind else 0.45 * 0.50 * live_sum_s)
-                est_cpu_s = LIVE_FIXED_OVERHEAD_S + LIVE_SPEED_FACTOR * live_sum_s
+                live_sim_s = sum(dur_ms[n] for n in maybe_live) / 1000.0
+                live_cpu_sum_s = sum(_est_live_cpu(n) for n in maybe_live)
+                expected_savings_s = (static_cost_ms - blind_cost_ms) / 1000.0 - (
+                    0.45 * (2.0 + 0.50 * live_sim_s) if not keep_blind else 0.45 * 0.50 * live_sim_s
+                )
+                est_cpu_s = LIVE_FIXED_OVERHEAD_S + live_cpu_sum_s
 
                 if (
-                    live_sum_s <= LIVE_COMMIT_MAX_S
+                    live_cpu_sum_s <= LIVE_COMMIT_MAX_S
                     and est_cpu_s < LIVE_EV_THRESHOLD * expected_savings_s
                     and live_budget_used_s + est_cpu_s <= TOTAL_LIVE_BUDGET_S
                 ):
-                    if not preloaded and any(
-                        test_by_num[n]["file"] in ("tests/test_executor.py", "tests/dialects/test_duckdb.py")
-                        or "dataframe" in test_by_num[n]["file"]
-                        for n in maybe_live
-                    ):
-                        _preload_heavy_third_party()
-                        preloaded = True
-                    live_calls += 1
-                    t0 = time.perf_counter()
-                    failed_live = run_live_tests(patched_files, maybe_live, test_by_num, dur_ms)
-                    dt = time.perf_counter() - t0
-                    live_budget_used_s += dt
-                    print(
-                        f"[live] {commit_id}: {len(maybe_live)}->{len(failed_live) if failed_live is not None else 'NONE'} ({dt:.2f}s)",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    if failed_live is not None:
-                        final_nums = keep_blind | failed_live
+                    to_run = maybe_live
+                    untested = keep_blind
+                else:
+                    # Targeted live-testing of fast-live bargains (e.g. test_generator_memory: 6.69s sim / 1.45s live)
+                    hot = [
+                        n for n in maybe_live
+                        if (dur_ms[n] / 1000.0) >= 1.2 and _est_live_cpu(n) <= 0.55 * (dur_ms[n] / 1000.0)
+                    ]
+                    if hot:
+                        hot_set = set(hot)
+                        rest = candidates - hot_set
+                        _, rest_cost_ms = optimize_workers_with_cost(rest, dur_ms)
+                        hot_saved_s = (static_cost_ms - rest_cost_ms) / 1000.0
+                        hot_cpu_s = LIVE_FIXED_OVERHEAD_S + sum(_est_live_cpu(n) for n in hot)
+                        if (
+                            hot_cpu_s < LIVE_EV_THRESHOLD * 0.80 * hot_saved_s
+                            and live_budget_used_s + hot_cpu_s <= TOTAL_LIVE_BUDGET_S
+                        ):
+                            to_run = hot
+                            untested = rest
+
+            if to_run:
+                if not preloaded and any(
+                    test_by_num[n]["file"] in ("tests/test_executor.py", "tests/dialects/test_duckdb.py")
+                    or "dataframe" in test_by_num[n]["file"]
+                    for n in to_run
+                ):
+                    _preload_heavy_third_party()
+                    preloaded = True
+                live_calls += 1
+                t0 = time.perf_counter()
+                failed_live = run_live_tests(patched_files, to_run, test_by_num, dur_ms)
+                dt = time.perf_counter() - t0
+                live_budget_used_s += dt
+                print(
+                    f"[live] {commit_id}: {len(to_run)}->{len(failed_live) if failed_live is not None else 'NONE'} ({dt:.2f}s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if failed_live is not None:
+                    final_nums = untested | failed_live
 
         workers, _ = optimize_workers_with_cost(final_nums, dur_ms)
         print(json.dumps({"commit": commit_id, "workers": workers}), flush=True)
