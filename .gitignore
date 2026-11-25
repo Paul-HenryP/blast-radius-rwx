@@ -6,6 +6,7 @@ venv/
 *.egg-info/
 
 # Data & Local Caches
+.idea/
 /data/
 *.patch
 *.json
@@ -18,3 +19,4 @@ blast-radius-sample.tar.gz
 
 
 sqlglot/
+profile_output.txt
